@@ -1,28 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-Perpvia Pioneer 积分赛 × 世界杯预测季 — Telegram 积分 Bot
-========================================================
-一份给 Soren 的、可直接部署运行的积分机器人。
+Perpvia Pioneer Points Race x World Cup Prediction Season - Telegram Points Bot
+================================================================================
+A ready-to-deploy points bot for Soren. All user-facing text is in English.
 
-设计目标:把 Soren 每天的手工时间压到最低。
-机器自动做:签到 / 发言计数 / 邀请追踪与48h判定 / 双轨积分 / 榜单导出。
-Soren 手动做(用指令,几秒钟):报比赛结果 / 给截图任务加分 / 周榜清零。
+Goal: minimize Soren's daily manual work.
+Automatic: check-in / message counting / invite tracking & 48h validation /
+           dual-track points / leaderboard export.
+Manual (commands, seconds): report match results / award screenshot tasks /
+           weekly reset.
 
-积分规则(对应方案):
-- 签到 /checkin            : +5,每日一次;连续7天额外 +20
-- 有效发言 >=5 条/日        : +5(每日封顶一次),刷屏不计
-- 邀请(48h不退+1次活跃)   : +15/有效人,无每日上限
-- 竞猜参与                  : +2/场;猜中小组赛 +10 / 淘汰赛 +8;连中3场 +15
-- 截图/漏斗任务            : 管理员 /award 手动加分
-双轨:
-- total_points  全程累计,永不清零 -> 总榜
-- week_points   当周积分,每周一 /reset_week 清零 -> 周榜
+Scoring rules:
+- Check-in /checkin        : +5, once a day; +20 bonus every 7-day streak
+- Active chat >=5 msgs/day  : +5 (once per day max), spam not counted
+- Invite (48h stay + 1 activity): +15 per valid user, no daily cap
+- Prediction join           : +2/match; correct group stage +10 / knockout +8;
+                              3 correct in a row +15
+- Screenshot/funnel tasks   : admin /award manual points
+Dual-track:
+- total_points  cumulative, never reset -> overall leaderboard
+- week_points   weekly, reset every Monday via /reset_week -> weekly leaderboard
 """
 
 import os
 import logging
 import datetime as dt
-from collections import defaultdict
 
 from telegram import Update, Poll
 from telegram.ext import (
@@ -31,25 +33,31 @@ from telegram.ext import (
 )
 
 # ----------------------------------------------------------------------------
-# 配置:从环境变量读取,部署时在托管平台填写,不要把 token 写死在代码里
+# Config: read from environment variables. Set these on your hosting platform.
+# Never hard-code the token in the file.
 # ----------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-# 管理员 TG 数字ID(只有这些人能用 /settle /award /reset_week 等管理指令)
-# 多个用逗号分隔,例如 "123456789,987654321"。先填你自己的ID。
+# Admin TG numeric IDs (only these can use /settle /award /reset_week etc.)
+# Comma-separated, e.g. "123456789,987654321". Put your own ID first.
 ADMIN_IDS = set(
     int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x
 )
 
-# 数据库文件路径(托管平台上用持久卷,否则重启会丢数据,见部署说明)
+# Public group username WITHOUT the @ (e.g. if your group is t.me/perpvia,
+# set GROUP_USERNAME=perpvia). Used to build invite links that open the group.
+GROUP_USERNAME = os.environ.get("GROUP_USERNAME", "").lstrip("@")
+
+# Database file path (use a persistent volume on the host, otherwise data is
+# lost on restart - see deployment notes).
 DB_PATH = os.environ.get("DB_PATH", "perpvia.db")
 
-# 积分规则参数(想改分值改这里即可,不用动逻辑)
+# Scoring parameters (change values here, no need to touch logic)
 PTS_CHECKIN = 5
 PTS_CHECKIN_STREAK7 = 20
 PTS_TALK_DAILY = 5
-TALK_THRESHOLD = 5            # 当日有效发言达到多少条给分
+TALK_THRESHOLD = 5            # messages/day needed to earn the chat points
 PTS_INVITE = 15
-INVITE_HOLD_HOURS = 48        # 被邀请人需停留多少小时
+INVITE_HOLD_HOURS = 48        # hours an invited user must stay
 PTS_PREDICT_JOIN = 2
 PTS_PREDICT_HIT_GROUP = 10
 PTS_PREDICT_HIT_KO = 8
@@ -62,7 +70,7 @@ logging.basicConfig(
 log = logging.getLogger("perpvia")
 
 # ----------------------------------------------------------------------------
-# 数据层:用 SQLite,零额外依赖,单文件,适合一个人独立运营
+# Data layer: SQLite, zero extra dependencies, single file.
 # ----------------------------------------------------------------------------
 import sqlite3
 
@@ -88,7 +96,6 @@ def init_db():
             had_activity INTEGER DEFAULT 0
         )
     """)
-    # 每日发言计数:user_id + 日期 -> 条数,以及当日是否已给过发言分
     c.execute("""
         CREATE TABLE IF NOT EXISTS talk (
             user_id INTEGER, day TEXT, count INTEGER DEFAULT 0,
@@ -96,7 +103,6 @@ def init_db():
             PRIMARY KEY (user_id, day)
         )
     """)
-    # 竞猜:每场一条;用户投票记录
     c.execute("""
         CREATE TABLE IF NOT EXISTS predict_polls (
             poll_id TEXT PRIMARY KEY, match TEXT, stage TEXT,
@@ -109,10 +115,16 @@ def init_db():
             PRIMARY KEY (poll_id, user_id)
         )
     """)
-    # 竞猜连胜计数(连中3场用)
     c.execute("""
         CREATE TABLE IF NOT EXISTS predict_streak (
             user_id INTEGER PRIMARY KEY, streak INTEGER DEFAULT 0
+        )
+    """)
+    # Pending invites captured from group-join deep links, awaiting the user
+    # to actually appear (handled when they first send a message / are seen).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS pending_invites (
+            invitee_id INTEGER PRIMARY KEY, inviter_id INTEGER, ts TEXT
         )
     """)
     conn.commit()
@@ -120,7 +132,7 @@ def init_db():
 
 def ensure_user(user_id, username, invited_by=None):
     conn = db(); c = conn.cursor()
-    row = c.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
+    row = c.execute("SELECT user_id, invited_by FROM users WHERE user_id=?", (user_id,)).fetchone()
     if not row:
         c.execute(
             "INSERT INTO users (user_id, username, joined_at, invited_by) VALUES (?,?,?,?)",
@@ -128,10 +140,13 @@ def ensure_user(user_id, username, invited_by=None):
         )
     else:
         c.execute("UPDATE users SET username=? WHERE user_id=?", (username, user_id))
+        # Backfill inviter if we learn it later and it wasn't set before
+        if invited_by and not row["invited_by"]:
+            c.execute("UPDATE users SET invited_by=? WHERE user_id=?", (invited_by, user_id))
     conn.commit(); conn.close()
 
 def add_points(user_id, pts):
-    """同时加到总榜和周榜(双轨)。"""
+    """Add to both total and weekly (dual-track)."""
     conn = db(); c = conn.cursor()
     c.execute(
         "UPDATE users SET total_points=total_points+?, week_points=week_points+? WHERE user_id=?",
@@ -146,17 +161,18 @@ def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 # ----------------------------------------------------------------------------
-# 用户指令
+# User commands
 # ----------------------------------------------------------------------------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚽ 欢迎加入 Perpvia Pioneer 积分赛!\n\n"
-        "常用指令:\n"
-        "/checkin 每日签到 (+5,连签7天额外+20)\n"
-        "/me 查看我的积分\n"
-        "/rank 查看我的排名\n"
-        "/invite 获取我的专属邀请链接\n\n"
-        "每日完成任务、参与世界杯竞猜,冲榜赢奖池!"
+        "⚽ Welcome to the Perpvia Pioneer Points Race!\n\n"
+        "Common commands:\n"
+        "/checkin - Daily check-in (+5, +20 bonus on a 7-day streak)\n"
+        "/me - View my points\n"
+        "/rank - View my ranking\n"
+        "/invite - Get my personal invite link\n\n"
+        "Complete daily tasks, join the World Cup predictions, "
+        "and climb the leaderboard to win the prize pool!"
     )
 
 async def cmd_checkin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -167,7 +183,7 @@ async def cmd_checkin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     today = today_str()
     if row["last_checkin"] == today:
         conn.close()
-        await update.message.reply_text("今天已经签到过啦 ✅ 明天再来~")
+        await update.message.reply_text("You've already checked in today ✅ Come back tomorrow!")
         return
     yesterday = (dt.date.today() - dt.timedelta(days=1)).isoformat()
     streak = (row["checkin_streak"] or 0) + 1 if row["last_checkin"] == yesterday else 1
@@ -178,9 +194,9 @@ async def cmd_checkin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     conn.commit(); conn.close()
     add_points(u.id, PTS_CHECKIN + bonus)
-    msg = f"✅ 签到成功 +{PTS_CHECKIN} 分!连续签到 {streak} 天。"
+    msg = f"✅ Check-in successful! +{PTS_CHECKIN} points. Current streak: {streak} day(s)."
     if bonus:
-        msg += f"\n🎁 连签 {streak} 天达成,额外 +{bonus} 分!"
+        msg += f"\n🎁 {streak}-day streak reached - extra +{bonus} points!"
     await update.message.reply_text(msg)
 
 async def cmd_me(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -192,8 +208,10 @@ async def cmd_me(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ).fetchone()
     conn.close()
     await update.message.reply_text(
-        f"📊 你的积分\n总榜累计:{row['total_points']} 分\n"
-        f"本周积分:{row['week_points']} 分\n连续签到:{row['checkin_streak']} 天"
+        f"📊 Your points\n"
+        f"Overall total: {row['total_points']} pts\n"
+        f"This week: {row['week_points']} pts\n"
+        f"Check-in streak: {row['checkin_streak']} day(s)"
     )
 
 async def cmd_rank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -203,25 +221,40 @@ async def cmd_rank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn.close()
     pos = next((i + 1 for i, r in enumerate(rows) if r["user_id"] == u.id), None)
     if pos:
-        await update.message.reply_text(f"🏆 你当前总榜排名:第 {pos} 名 / 共 {len(rows)} 人")
+        await update.message.reply_text(f"🏆 Your overall rank: #{pos} of {len(rows)} participants")
     else:
-        await update.message.reply_text("你还没有积分,先 /checkin 开始吧!")
+        await update.message.reply_text("You don't have any points yet. Start with /checkin!")
 
 async def cmd_invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """生成专属邀请深链。被邀请人通过此链接进群,自动归因。"""
+    """Generate a personal invite link that opens the public GROUP and carries
+    the inviter's ID so the bot can attribute the invite."""
     u = update.effective_user
     ensure_user(u.id, u.username or u.first_name)
-    bot_username = (await ctx.bot.get_me()).username
-    # 用 start 深链携带邀请人ID;被邀请人点开会先 /start bot,再引导进群
-    link = f"https://t.me/{bot_username}?start=inv_{u.id}"
-    await update.message.reply_text(
-        f"🔗 你的专属邀请链接:\n{link}\n\n"
-        f"好友通过它进入社区,停留满 {INVITE_HOLD_HOURS} 小时且有过互动,"
-        f"你将获得 +{PTS_INVITE} 分/人(无上限)!"
-    )
+    if GROUP_USERNAME:
+        # startgroup deep link: opens the bot's "add to group" / join flow for
+        # the public group while carrying the inviter id as payload.
+        link = f"https://t.me/{GROUP_USERNAME}?start=inv_{u.id}"
+        # Note: for a public group, the cleanest user flow is a direct group
+        # link. We also expose a tracking link below.
+        track = f"https://t.me/{(await ctx.bot.get_me()).username}?start=inv_{u.id}"
+        await update.message.reply_text(
+            f"🔗 Your personal invite link:\n{link}\n\n"
+            f"(Tracking link, ensures you get credit:\n{track})\n\n"
+            f"When a friend joins through your link, stays for {INVITE_HOLD_HOURS}h "
+            f"and interacts at least once, you earn +{PTS_INVITE} points per friend "
+            f"(no cap)!"
+        )
+    else:
+        # Fallback: bot-start tracking link only
+        track = f"https://t.me/{(await ctx.bot.get_me()).username}?start=inv_{u.id}"
+        await update.message.reply_text(
+            f"🔗 Your personal invite link:\n{track}\n\n"
+            f"When a friend joins through it, stays for {INVITE_HOLD_HOURS}h and "
+            f"interacts at least once, you earn +{PTS_INVITE} points per friend (no cap)!"
+        )
 
 async def cmd_start_with_payload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """处理带邀请参数的 /start inv_<inviterid>。"""
+    """Handle /start inv_<inviterid> - records the invite relationship."""
     args = ctx.args
     u = update.effective_user
     invited_by = None
@@ -232,10 +265,49 @@ async def cmd_start_with_payload(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
             invited_by = None
     if invited_by and invited_by != u.id:
         ensure_user(u.id, u.username or u.first_name, invited_by=invited_by)
+        # also stash as pending in case the user row already existed
+        conn = db()
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_invites (invitee_id, inviter_id, ts) VALUES (?,?,?)",
+            (u.id, invited_by, dt.datetime.utcnow().isoformat()),
+        )
+        conn.commit(); conn.close()
+        # And direct them to the group
+        if GROUP_USERNAME:
+            await update.message.reply_text(
+                f"✅ You're in! Join the community here 👉 https://t.me/{GROUP_USERNAME}\n\n"
+                "Then come back and use /checkin to start earning points."
+            )
+            return
     await cmd_start(update, ctx)
 
 # ----------------------------------------------------------------------------
-# 自动:发言计数(刷屏不计由 Telegram/Rose 反spam配合,这里做基础阈值)
+# New member tracking: when someone joins the group, attribute pending invite.
+# ----------------------------------------------------------------------------
+async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Fires on member status changes. When a new member joins, if we have a
+    pending invite for them, set invited_by."""
+    res = update.chat_member
+    if not res:
+        return
+    new = res.new_chat_member
+    old = res.old_chat_member
+    # Detect a fresh join (was left/kicked/none -> member)
+    joined = (
+        old.status in ("left", "kicked") and new.status in ("member", "administrator", "creator")
+    )
+    if not joined:
+        return
+    uid = new.user.id
+    uname = new.user.username or new.user.first_name
+    conn = db(); c = conn.cursor()
+    p = c.execute("SELECT inviter_id FROM pending_invites WHERE invitee_id=?", (uid,)).fetchone()
+    conn.close()
+    inviter = p["inviter_id"] if p else None
+    ensure_user(uid, uname, invited_by=inviter)
+
+# ----------------------------------------------------------------------------
+# Automatic: message counting (spam exclusion handled with Rose/Telegram)
 # ----------------------------------------------------------------------------
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
@@ -249,11 +321,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "ON CONFLICT(user_id, day) DO UPDATE SET count=count+1",
         (u.id, day),
     )
-    # 标记该用户有互动(用于邀请48h判定)
     c.execute("UPDATE users SET had_activity=1 WHERE user_id=?", (u.id,))
     row = c.execute("SELECT count, credited FROM talk WHERE user_id=? AND day=?", (u.id, day)).fetchone()
     conn.commit(); conn.close()
-    # 达到阈值且当天未给过 -> 给发言分
     if row["count"] >= TALK_THRESHOLD and row["credited"] == 0:
         conn = db(); conn.execute(
             "UPDATE talk SET credited=1 WHERE user_id=? AND day=?", (u.id, day)
@@ -261,7 +331,7 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         add_points(u.id, PTS_TALK_DAILY)
 
 # ----------------------------------------------------------------------------
-# 邀请48h判定:由定时任务每小时扫一遍,满足条件的补发邀请分
+# Invite 48h validation: hourly job credits valid invites
 # ----------------------------------------------------------------------------
 async def job_credit_invites(ctx: ContextTypes.DEFAULT_TYPE):
     conn = db(); c = conn.cursor()
@@ -284,45 +354,47 @@ async def job_credit_invites(ctx: ContextTypes.DEFAULT_TYPE):
             credited += 1
     conn.close()
     if credited:
-        log.info(f"邀请补发:本轮给 {credited} 个有效邀请加分")
+        log.info(f"Invite credit: awarded {credited} valid invite(s) this round")
 
 # ----------------------------------------------------------------------------
-# 竞猜:管理员开盘 -> bot发非匿名投票 -> 用户投 -> 管理员报结果 -> bot自动结算
+# Predictions
 # ----------------------------------------------------------------------------
 async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/predict 小组赛|淘汰赛 对阵名 选项1 选项2 [选项3]
-    例: /predict 小组赛 阿根廷vs法国 阿根廷胜 平局 法国胜
+    """/predict group|knockout <match> <opt1> <opt2> [opt3]
+    e.g. /predict group ARGvsFRA ARG_win Draw FRA_win
+    Stage words containing 'knockout' or 'ko' use the knockout point value.
     """
     if not is_admin(update.effective_user.id):
         return
     parts = update.message.text.split(maxsplit=4)
     if len(parts) < 4:
         await update.message.reply_text(
-            "用法:/predict 小组赛 对阵名 选项1 选项2 [选项3]\n"
-            "例:/predict 小组赛 阿根廷vs法国 阿根廷胜 平局 法国胜"
+            "Usage: /predict <stage> <match> <opt1> <opt2> [opt3]\n"
+            "e.g. /predict group ARGvsFRA ARG_win Draw FRA_win"
         )
         return
     stage = parts[1]
     match = parts[2]
     options = parts[3].split()
     if len(options) < 2:
-        await update.message.reply_text("至少要2个选项(独赢二选一或加平局三选一)")
+        await update.message.reply_text("Need at least 2 options (2-way win or 3-way with draw).")
         return
     sent = await ctx.bot.send_poll(
         chat_id=update.effective_chat.id,
-        question=f"⚽ {match} 你预测谁赢?({stage})",
+        question=f"⚽ {match} - who will win? ({stage})",
         options=options,
-        is_anonymous=False,          # 关键:非匿名才能记分!
+        is_anonymous=False,          # MUST be non-anonymous to score!
         allows_multiple_answers=False,
     )
     conn = db(); conn.execute(
         "INSERT INTO predict_polls (poll_id, match, stage, options, day) VALUES (?,?,?,?,?)",
         (sent.poll.id, match, stage, "|".join(options), today_str()),
     ); conn.commit(); conn.close()
-    await update.message.reply_text(f"✅ 已开盘:{match}。参与+{PTS_PREDICT_JOIN},猜中更多分。")
+    await update.message.reply_text(
+        f"✅ Poll opened: {match}. Voting +{PTS_PREDICT_JOIN}, correct guess earns more."
+    )
 
 async def on_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """记录用户投票 + 立即给参与分。"""
     ans = update.poll_answer
     if not ans.option_ids:
         return
@@ -342,18 +414,17 @@ async def on_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     conn.commit(); conn.close()
     if not exists:
-        add_points(user.id, PTS_PREDICT_JOIN)   # 参与就加分
+        add_points(user.id, PTS_PREDICT_JOIN)
 
 async def cmd_settle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/settle <对阵名> <正确选项>
-    例: /settle 阿根廷vs法国 阿根廷胜
-    bot 自动给所有猜中者加分,并处理连胜。
+    """/settle <match> <correct_option>
+    e.g. /settle ARGvsFRA ARG_win
     """
     if not is_admin(update.effective_user.id):
         return
     parts = update.message.text.split(maxsplit=2)
     if len(parts) < 3:
-        await update.message.reply_text("用法:/settle 对阵名 正确选项\n例:/settle 阿根廷vs法国 阿根廷胜")
+        await update.message.reply_text("Usage: /settle <match> <correct_option>\ne.g. /settle ARGvsFRA ARG_win")
         return
     match, correct = parts[1], parts[2]
     conn = db(); c = conn.cursor()
@@ -361,15 +432,17 @@ async def cmd_settle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "SELECT poll_id, options, stage, settled FROM predict_polls WHERE match=? ORDER BY rowid DESC", (match,)
     ).fetchone()
     if not poll:
-        conn.close(); await update.message.reply_text(f"没找到对阵:{match}"); return
+        conn.close(); await update.message.reply_text(f"No poll found for match: {match}"); return
     if poll["settled"] == 1:
-        conn.close(); await update.message.reply_text("这场已经结算过了"); return
+        conn.close(); await update.message.reply_text("This match has already been settled."); return
     options = poll["options"].split("|")
     if correct not in options:
         conn.close()
-        await update.message.reply_text(f"选项不对。可选:{' / '.join(options)}"); return
+        await update.message.reply_text(f"Invalid option. Choose from: {' / '.join(options)}"); return
     correct_idx = options.index(correct)
-    hit_pts = PTS_PREDICT_HIT_KO if "淘汰" in poll["stage"] else PTS_PREDICT_HIT_GROUP
+    stage_l = poll["stage"].lower()
+    is_ko = ("knockout" in stage_l) or ("ko" in stage_l) or ("淘汰" in poll["stage"])
+    hit_pts = PTS_PREDICT_HIT_KO if is_ko else PTS_PREDICT_HIT_GROUP
     votes = c.execute("SELECT user_id, choice FROM predict_votes WHERE poll_id=?", (poll["poll_id"],)).fetchall()
     hit_users, miss_users = [], []
     for v in votes:
@@ -377,7 +450,6 @@ async def cmd_settle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             hit_users.append(v["user_id"])
         else:
             miss_users.append(v["user_id"])
-    # 加命中分 + 连胜处理
     streak_bonus_count = 0
     for uid in hit_users:
         add_points(uid, hit_pts)
@@ -392,16 +464,16 @@ async def cmd_settle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     c.execute("UPDATE predict_polls SET settled=1 WHERE poll_id=?", (poll["poll_id"],))
     conn.commit(); conn.close()
     await update.message.reply_text(
-        f"✅ {match} 结算完成!正确:{correct}\n"
-        f"猜中 {len(hit_users)} 人,各 +{hit_pts} 分。\n"
-        f"达成连中3场 {streak_bonus_count} 人,额外 +{PTS_PREDICT_STREAK3} 分。"
+        f"✅ {match} settled! Correct answer: {correct}\n"
+        f"{len(hit_users)} correct, +{hit_pts} pts each.\n"
+        f"{streak_bonus_count} hit a 3-in-a-row streak, +{PTS_PREDICT_STREAK3} bonus."
     )
 
 # ----------------------------------------------------------------------------
-# 管理员:手动加分(截图/漏斗任务) + 榜单 + 周榜清零
+# Admin: manual award + leaderboards + weekly reset
 # ----------------------------------------------------------------------------
 async def cmd_award(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/award @用户名 分数  或  回复某条消息后 /award 分数"""
+    """/award @username points  OR  reply to a message + /award points"""
     if not is_admin(update.effective_user.id):
         return
     target_id, target_name, pts = None, None, None
@@ -411,53 +483,57 @@ async def cmd_award(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             pts = int(update.message.text.split()[1])
         except (IndexError, ValueError):
-            await update.message.reply_text("用法(回复模式):回复目标消息 + /award 30"); return
+            await update.message.reply_text("Usage (reply mode): reply to a message + /award 30"); return
     else:
         parts = update.message.text.split()
         if len(parts) < 3:
-            await update.message.reply_text("用法:/award @用户名 30  或  回复某消息 /award 30"); return
+            await update.message.reply_text("Usage: /award @username 30  OR  reply to a message /award 30"); return
         target_name = parts[1].lstrip("@")
         try:
             pts = int(parts[2])
         except ValueError:
-            await update.message.reply_text("分数要是数字"); return
+            await update.message.reply_text("Points must be a number."); return
         conn = db()
         row = conn.execute("SELECT user_id FROM users WHERE username=?", (target_name,)).fetchone()
         conn.close()
         if not row:
-            await update.message.reply_text(f"没找到用户 @{target_name}(他需先和bot说过话/进过群)"); return
+            await update.message.reply_text(
+                f"User @{target_name} not found (they must have messaged the bot / joined the group first)."
+            ); return
         target_id = row["user_id"]
     add_points(target_id, pts)
-    await update.message.reply_text(f"✅ 已给 @{target_name} 加 {pts} 分")
+    await update.message.reply_text(f"✅ Awarded {pts} points to @{target_name}.")
 
 async def cmd_top10(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/top10 总榜  /top10 week 周榜"""
+    """/top10 overall  |  /top10 week weekly"""
     if not is_admin(update.effective_user.id):
         return
     arg = ctx.args[0] if ctx.args else "total"
     col = "week_points" if arg == "week" else "total_points"
-    title = "本周积分榜" if arg == "week" else "总榜累计"
+    title = "Weekly Leaderboard" if arg == "week" else "Overall Leaderboard"
     conn = db()
     rows = conn.execute(
         f"SELECT username, {col} AS p FROM users ORDER BY {col} DESC LIMIT 10"
     ).fetchall()
     conn.close()
     medals = ["🥇", "🥈", "🥉"] + ["▫️"] * 7
-    lines = [f"🏆 {title} TOP 10\n"]
+    lines = [f"🏆 {title} - TOP 10\n"]
     for i, r in enumerate(rows):
-        name = f"@{r['username']}" if r["username"] else "匿名用户"
-        lines.append(f"{medals[i]} {name} — {r['p']} 分")
+        name = f"@{r['username']}" if r["username"] else "Anonymous"
+        lines.append(f"{medals[i]} {name} - {r['p']} pts")
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_reset_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """每周一用:清零所有人 week_points(总榜不动)。"""
+    """Monday: reset everyone's week_points (overall total unaffected)."""
     if not is_admin(update.effective_user.id):
         return
     conn = db(); conn.execute("UPDATE users SET week_points=0"); conn.commit(); conn.close()
-    await update.message.reply_text("✅ 本周积分已清零,新一周开始!(总榜累计分不受影响)")
+    await update.message.reply_text(
+        "✅ Weekly points reset. A new week begins! (Overall totals are unaffected.)"
+    )
 
 async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """导出全部积分为CSV,发给管理员存档/结算用。"""
+    """Export all points as CSV to the admin."""
     if not is_admin(update.effective_user.id):
         return
     import csv, io
@@ -477,32 +553,30 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.send_document(chat_id=update.effective_chat.id, document=data)
 
 async def cmd_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/count 当前参赛人数(有积分的用户数)"""
+    """/count current participant numbers"""
     if not is_admin(update.effective_user.id):
         return
     conn = db()
     total = conn.execute("SELECT COUNT(*) AS n FROM users").fetchone()["n"]
     active = conn.execute("SELECT COUNT(*) AS n FROM users WHERE total_points>0").fetchone()["n"]
     conn.close()
-    await update.message.reply_text(f"👥 已登记 {total} 人,其中 {active} 人有积分")
+    await update.message.reply_text(f"👥 {total} registered, {active} with points.")
 
 # ----------------------------------------------------------------------------
-# 启动
+# Startup
 # ----------------------------------------------------------------------------
 def main():
     if not BOT_TOKEN:
-        raise SystemExit("缺少 BOT_TOKEN 环境变量,请在部署平台填写。")
+        raise SystemExit("Missing BOT_TOKEN environment variable. Set it on your host.")
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # /start 带邀请参数特殊处理
     app.add_handler(CommandHandler("start", cmd_start_with_payload))
     app.add_handler(CommandHandler("checkin", cmd_checkin))
     app.add_handler(CommandHandler("me", cmd_me))
     app.add_handler(CommandHandler("rank", cmd_rank))
     app.add_handler(CommandHandler("invite", cmd_invite))
 
-    # 管理员
     app.add_handler(CommandHandler("predict", cmd_predict))
     app.add_handler(CommandHandler("settle", cmd_settle))
     app.add_handler(CommandHandler("award", cmd_award))
@@ -511,15 +585,15 @@ def main():
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("count", cmd_count))
 
-    # 投票回调
     app.add_handler(PollAnswerHandler(on_poll_answer))
-    # 发言计数(放最后,捕获普通文本)
+    # Track joins for invite attribution
+    app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    # Message counting (last, catches plain text)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    # 定时任务:每小时核一次48h邀请
     app.job_queue.run_repeating(job_credit_invites, interval=3600, first=60)
 
-    log.info("Perpvia bot 启动中...")
+    log.info("Perpvia bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
