@@ -607,6 +607,29 @@ async def cmd_reset_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "✅ Weekly points reset. A new week begins! (Overall totals are unaffected.)"
     )
 
+async def cmd_reset_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """DANGER: wipe ALL data (users, points, predictions, invites) for a fresh
+    start in a new group. Requires confirmation: /reset_all CONFIRM"""
+    if not is_admin(update.effective_user.id):
+        return
+    parts = update.message.text.split()
+    if len(parts) < 2 or parts[1] != "CONFIRM":
+        await update.message.reply_text(
+            "⚠️ This will PERMANENTLY DELETE all users, points, predictions and "
+            "invite links. This cannot be undone.\n\n"
+            "If you are sure, send:\n/reset_all CONFIRM"
+        )
+        return
+    conn = db(); c = conn.cursor()
+    for tbl in ["users", "talk", "predict_polls", "predict_votes",
+                "predict_streak", "pending_invites", "invite_links"]:
+        c.execute(f"DELETE FROM {tbl}")
+    conn.commit(); conn.close()
+    await update.message.reply_text(
+        "🧹 All data wiped. Fresh start! Everyone begins at 0 points.\n"
+        "Make sure GROUP_CHAT_ID / GROUP_USERNAME now point to this new group."
+    )
+
 async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Export all points as CSV to the admin."""
     if not is_admin(update.effective_user.id):
@@ -661,6 +684,7 @@ def main():
     app.add_handler(CommandHandler("award", cmd_award))
     app.add_handler(CommandHandler("top10", cmd_top10))
     app.add_handler(CommandHandler("reset_week", cmd_reset_week))
+    app.add_handler(CommandHandler("reset_all", cmd_reset_all))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("count", cmd_count))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
