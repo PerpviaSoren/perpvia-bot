@@ -44,8 +44,18 @@ ADMIN_IDS = set(
 )
 
 # Public group username WITHOUT the @ (e.g. if your group is t.me/perpvia,
-# set GROUP_USERNAME=perpvia). Used to build invite links that open the group.
+# set GROUP_USERNAME=perpvia). Used as a fallback link.
 GROUP_USERNAME = os.environ.get("GROUP_USERNAME", "").lstrip("@")
+
+# Group numeric chat ID (REQUIRED for native named invite links).
+# How to get it: add the bot to the group as admin, then in the group send
+# /chatid  -> the bot replies with the ID (a negative number like -1001234567890).
+# Put that number here as the GROUP_CHAT_ID environment variable.
+GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID", "")
+try:
+    GROUP_CHAT_ID = int(GROUP_CHAT_ID) if GROUP_CHAT_ID else None
+except ValueError:
+    GROUP_CHAT_ID = None
 
 # Database file path (use a persistent volume on the host, otherwise data is
 # lost on restart - see deployment notes).
@@ -125,6 +135,12 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS pending_invites (
             invitee_id INTEGER PRIMARY KEY, inviter_id INTEGER, ts TEXT
+        )
+    """)
+    # Native named invite links: maps each created link to the inviter.
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS invite_links (
+            invite_link TEXT PRIMARY KEY, inviter_id INTEGER, created_at TEXT
         )
     """)
     conn.commit()
@@ -226,32 +242,70 @@ async def cmd_rank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("You don't have any points yet. Start with /checkin!")
 
 async def cmd_invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Generate a personal invite link that opens the public GROUP and carries
-    the inviter's ID so the bot can attribute the invite."""
+    """Create a NATIVE named group invite link for this user via Telegram API.
+    Friends who click it join the group directly; Telegram tells the bot which
+    link they used, so attribution is automatic and accurate."""
     u = update.effective_user
     ensure_user(u.id, u.username or u.first_name)
-    if GROUP_USERNAME:
-        # startgroup deep link: opens the bot's "add to group" / join flow for
-        # the public group while carrying the inviter id as payload.
-        link = f"https://t.me/{GROUP_USERNAME}?start=inv_{u.id}"
-        # Note: for a public group, the cleanest user flow is a direct group
-        # link. We also expose a tracking link below.
-        track = f"https://t.me/{(await ctx.bot.get_me()).username}?start=inv_{u.id}"
+
+    # If we've already made a link for this user, reuse it (one link per user).
+    conn = db()
+    existing = conn.execute(
+        "SELECT invite_link FROM invite_links WHERE inviter_id=?", (u.id,)
+    ).fetchone()
+    conn.close()
+    if existing:
         await update.message.reply_text(
-            f"🔗 Your personal invite link:\n{link}\n\n"
-            f"(Tracking link, ensures you get credit:\n{track})\n\n"
-            f"When a friend joins through your link, stays for {INVITE_HOLD_HOURS}h "
-            f"and interacts at least once, you earn +{PTS_INVITE} points per friend "
-            f"(no cap)!"
+            f"🔗 Your personal invite link:\n{existing['invite_link']}\n\n"
+            f"Friends who join through it, stay {INVITE_HOLD_HOURS}h and interact "
+            f"at least once earn you +{PTS_INVITE} points each (no cap)!"
         )
-    else:
-        # Fallback: bot-start tracking link only
-        track = f"https://t.me/{(await ctx.bot.get_me()).username}?start=inv_{u.id}"
+        return
+
+    if not GROUP_CHAT_ID:
         await update.message.reply_text(
-            f"🔗 Your personal invite link:\n{track}\n\n"
-            f"When a friend joins through it, stays for {INVITE_HOLD_HOURS}h and "
-            f"interacts at least once, you earn +{PTS_INVITE} points per friend (no cap)!"
+            "⚠️ Invite links aren't configured yet. Admin: set GROUP_CHAT_ID "
+            "(use /chatid in the group) and give the bot 'Invite Users via Link' permission."
         )
+        return
+
+    try:
+        # name lets you see who owns the link in Telegram's admin UI too
+        link_obj = await ctx.bot.create_chat_invite_link(
+            chat_id=GROUP_CHAT_ID,
+            name=f"inv_{u.id}_{u.username or u.first_name}"[:32],
+            creates_join_request=False,   # direct join (your group is open-join)
+        )
+    except Exception as e:
+        log.error(f"create invite link failed: {e}")
+        await update.message.reply_text(
+            "⚠️ Couldn't create your link. The bot may be missing the "
+            "'Invite Users via Link' admin permission in the group."
+        )
+        return
+
+    conn = db()
+    conn.execute(
+        "INSERT OR REPLACE INTO invite_links (invite_link, inviter_id, created_at) VALUES (?,?,?)",
+        (link_obj.invite_link, u.id, dt.datetime.utcnow().isoformat()),
+    )
+    conn.commit(); conn.close()
+
+    await update.message.reply_text(
+        f"🔗 Your personal invite link:\n{link_obj.invite_link}\n\n"
+        f"Friends who join through it, stay {INVITE_HOLD_HOURS}h and interact "
+        f"at least once earn you +{PTS_INVITE} points each (no cap)!"
+    )
+
+
+async def cmd_chatid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin helper: print this chat's numeric ID so you can set GROUP_CHAT_ID."""
+    if not is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text(
+        f"This chat's ID is: {update.effective_chat.id}\n"
+        f"Set this as the GROUP_CHAT_ID environment variable."
+    )
 
 async def cmd_start_with_payload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /start inv_<inviterid> - records the invite relationship."""
@@ -285,14 +339,14 @@ async def cmd_start_with_payload(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 # New member tracking: when someone joins the group, attribute pending invite.
 # ----------------------------------------------------------------------------
 async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Fires on member status changes. When a new member joins, if we have a
-    pending invite for them, set invited_by."""
+    """Fires on member status changes. When a new member joins, attribute the
+    invite using the native invite link they joined through (Telegram provides
+    res.invite_link). Falls back to any pending start-link invite."""
     res = update.chat_member
     if not res:
         return
     new = res.new_chat_member
     old = res.old_chat_member
-    # Detect a fresh join (was left/kicked/none -> member)
     joined = (
         old.status in ("left", "kicked") and new.status in ("member", "administrator", "creator")
     )
@@ -300,10 +354,31 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     uid = new.user.id
     uname = new.user.username or new.user.first_name
-    conn = db(); c = conn.cursor()
-    p = c.execute("SELECT inviter_id FROM pending_invites WHERE invitee_id=?", (uid,)).fetchone()
-    conn.close()
-    inviter = p["inviter_id"] if p else None
+
+    inviter = None
+    # 1) Native named invite link attribution (preferred)
+    if res.invite_link and res.invite_link.invite_link:
+        conn = db()
+        row = conn.execute(
+            "SELECT inviter_id FROM invite_links WHERE invite_link=?",
+            (res.invite_link.invite_link,),
+        ).fetchone()
+        conn.close()
+        if row:
+            inviter = row["inviter_id"]
+    # 2) Fallback: pending start-link invite
+    if inviter is None:
+        conn = db()
+        p = conn.execute(
+            "SELECT inviter_id FROM pending_invites WHERE invitee_id=?", (uid,)
+        ).fetchone()
+        conn.close()
+        if p:
+            inviter = p["inviter_id"]
+
+    # Don't credit self-invites
+    if inviter == uid:
+        inviter = None
     ensure_user(uid, uname, invited_by=inviter)
 
 # ----------------------------------------------------------------------------
@@ -572,6 +647,10 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start_with_payload))
+    # /perpvia is the public-facing entry command (same welcome as /start).
+    # /start stays registered because Telegram requires it for deep links
+    # (invite tracking ?start=inv_xxx) and first-open of the bot.
+    app.add_handler(CommandHandler("perpvia", cmd_start))
     app.add_handler(CommandHandler("checkin", cmd_checkin))
     app.add_handler(CommandHandler("me", cmd_me))
     app.add_handler(CommandHandler("rank", cmd_rank))
@@ -584,6 +663,7 @@ def main():
     app.add_handler(CommandHandler("reset_week", cmd_reset_week))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("count", cmd_count))
+    app.add_handler(CommandHandler("chatid", cmd_chatid))
 
     app.add_handler(PollAnswerHandler(on_poll_answer))
     # Track joins for invite attribution
