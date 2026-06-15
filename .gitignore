@@ -1,0 +1,4 @@
+# Database files — should only live on the mounted volume at /data
+perpvia.db
+*.db
+/data/
