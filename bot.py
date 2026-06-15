@@ -441,8 +441,9 @@ async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     if not is_admin(update.effective_user.id):
         return
-    parts = update.message.text.split(maxsplit=4)
-    if len(parts) < 4:
+    parts = update.message.text.split()
+    # parts[0]=/predict, [1]=stage, [2]=match, [3:]=options
+    if len(parts) < 5:
         await update.message.reply_text(
             "Usage: /predict <stage> <match> <opt1> <opt2> [opt3]\n"
             "e.g. /predict group ARGvsFRA ARG_win Draw FRA_win"
@@ -450,9 +451,12 @@ async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     stage = parts[1]
     match = parts[2]
-    options = parts[3].split()
+    options = parts[3:]
     if len(options) < 2:
         await update.message.reply_text("Need at least 2 options (2-way win or 3-way with draw).")
+        return
+    if len(options) > 10:
+        await update.message.reply_text("Telegram polls allow at most 10 options.")
         return
     sent = await ctx.bot.send_poll(
         chat_id=update.effective_chat.id,
