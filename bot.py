@@ -511,7 +511,23 @@ async def cmd_settle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "SELECT poll_id, options, stage, settled FROM predict_polls WHERE match=? ORDER BY rowid DESC", (match,)
     ).fetchone()
     if not poll:
-        conn.close(); await update.message.reply_text(f"No poll found for match: {match}"); return
+        # Help the admin: show what match names actually exist
+        open_rows = c.execute(
+            "SELECT match FROM predict_polls WHERE settled=0 ORDER BY rowid DESC LIMIT 10"
+        ).fetchall()
+        conn.close()
+        if open_rows:
+            names = "\n".join(f"• {r['match']}" for r in open_rows)
+            await update.message.reply_text(
+                f"No poll found for: {match}\n\n"
+                f"Open polls you can settle (use the EXACT name):\n{names}\n\n"
+                f"Tip: send /polls to see names and options."
+            )
+        else:
+            await update.message.reply_text(
+                f"No poll found for: {match}\nNo open polls right now. Send /polls to check."
+            )
+        return
     if poll["settled"] == 1:
         conn.close(); await update.message.reply_text("This match has already been settled."); return
     options = poll["options"].split("|")
@@ -664,6 +680,27 @@ async def cmd_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await update.message.reply_text(f"👥 {total} registered, {active} with points.")
 
+async def cmd_polls(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """List recent prediction polls with their EXACT stored match names, so the
+    admin can copy the correct name into /settle."""
+    if not is_admin(update.effective_user.id):
+        return
+    conn = db()
+    rows = conn.execute(
+        "SELECT match, options, settled, day FROM predict_polls ORDER BY rowid DESC LIMIT 15"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("No prediction polls found yet.")
+        return
+    lines = ["📋 Recent polls (copy the exact match name into /settle):\n"]
+    for r in rows:
+        status = "✅ settled" if r["settled"] else "🟡 open"
+        opts = r["options"].replace("|", " / ")
+        lines.append(f"{status}  |  match: `{r['match']}`\n   options: {opts}")
+    lines.append("\nTo settle: /settle <match> <correct_option>")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 # ----------------------------------------------------------------------------
 # Startup
 # ----------------------------------------------------------------------------
@@ -691,6 +728,7 @@ def main():
     app.add_handler(CommandHandler("reset_all", cmd_reset_all))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("count", cmd_count))
+    app.add_handler(CommandHandler("polls", cmd_polls))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
 
     app.add_handler(PollAnswerHandler(on_poll_answer))
