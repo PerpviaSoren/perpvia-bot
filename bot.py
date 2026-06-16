@@ -173,6 +173,18 @@ def add_points(user_id, pts):
 def today_str():
     return dt.date.today().isoformat()
 
+def norm(s):
+    """Normalize a string for forgiving matching: drop emoji/symbols/spaces,
+    lowercase. So '🇪🇸ESPvs🇨🇻CPV', 'ESPvsCPV', 'esp vs cpv' all match."""
+    if s is None:
+        return ""
+    out = []
+    for ch in s:
+        # keep letters and digits only (ascii + unicode letters), drop the rest
+        if ch.isalnum() and not (0x1F000 <= ord(ch) <= 0x1FAFF) and not (0x1F1E6 <= ord(ch) <= 0x1F1FF):
+            out.append(ch.lower())
+    return "".join(out)
+
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
@@ -507,11 +519,21 @@ async def cmd_settle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     match, correct = parts[1], parts[2]
     conn = db(); c = conn.cursor()
+    # First try exact match, then fall back to normalized (emoji/space-insensitive)
     poll = c.execute(
-        "SELECT poll_id, options, stage, settled FROM predict_polls WHERE match=? ORDER BY rowid DESC", (match,)
+        "SELECT poll_id, match, options, stage, settled FROM predict_polls WHERE match=? ORDER BY rowid DESC", (match,)
     ).fetchone()
     if not poll:
-        # Help the admin: show what match names actually exist
+        # normalized fallback: scan open polls and compare normalized names
+        nmatch = norm(match)
+        candidates = c.execute(
+            "SELECT poll_id, match, options, stage, settled FROM predict_polls WHERE settled=0 ORDER BY rowid DESC"
+        ).fetchall()
+        for cand in candidates:
+            if norm(cand["match"]) == nmatch:
+                poll = cand
+                break
+    if not poll:
         open_rows = c.execute(
             "SELECT match FROM predict_polls WHERE settled=0 ORDER BY rowid DESC LIMIT 10"
         ).fetchall()
@@ -531,10 +553,19 @@ async def cmd_settle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if poll["settled"] == 1:
         conn.close(); await update.message.reply_text("This match has already been settled."); return
     options = poll["options"].split("|")
-    if correct not in options:
+    # match the correct option with normalized comparison too
+    correct_idx = None
+    if correct in options:
+        correct_idx = options.index(correct)
+    else:
+        ncorrect = norm(correct)
+        for i, o in enumerate(options):
+            if norm(o) == ncorrect:
+                correct_idx = i
+                break
+    if correct_idx is None:
         conn.close()
         await update.message.reply_text(f"Invalid option. Choose from: {' / '.join(options)}"); return
-    correct_idx = options.index(correct)
     stage_l = poll["stage"].lower()
     is_ko = ("knockout" in stage_l) or ("ko" in stage_l) or ("淘汰" in poll["stage"])
     hit_pts = PTS_PREDICT_HIT_KO if is_ko else PTS_PREDICT_HIT_GROUP
@@ -650,6 +681,26 @@ async def cmd_reset_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Make sure GROUP_CHAT_ID / GROUP_USERNAME now point to this new group."
     )
 
+async def cmd_clearpolls(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Delete ALL prediction polls + votes + streaks (test/junk cleanup).
+    Does NOT touch user points already awarded. Requires: /clearpolls CONFIRM"""
+    if not is_admin(update.effective_user.id):
+        return
+    parts = update.message.text.split()
+    if len(parts) < 2 or parts[1] != "CONFIRM":
+        await update.message.reply_text(
+            "⚠️ This deletes ALL prediction polls and their vote records "
+            "(useful to clear test/duplicate polls). Points already awarded stay.\n\n"
+            "If sure, send:\n/clearpolls CONFIRM"
+        )
+        return
+    conn = db(); c = conn.cursor()
+    for tbl in ["predict_polls", "predict_votes", "predict_streak"]:
+        c.execute(f"DELETE FROM {tbl}")
+    conn.commit(); conn.close()
+    await update.message.reply_text("🧹 All prediction polls cleared. You can open fresh polls now.")
+
+
 async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Export all points as CSV to the admin."""
     if not is_admin(update.effective_user.id):
@@ -697,9 +748,9 @@ async def cmd_polls(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         status = "✅ settled" if r["settled"] else "🟡 open"
         opts = r["options"].replace("|", " / ")
-        lines.append(f"{status}  |  match: `{r['match']}`\n   options: {opts}")
+        lines.append(f"{status}  |  match: {r['match']}\n   options: {opts}")
     lines.append("\nTo settle: /settle <match> <correct_option>")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(lines))
 
 # ----------------------------------------------------------------------------
 # Startup
@@ -726,6 +777,7 @@ def main():
     app.add_handler(CommandHandler("top10", cmd_top10))
     app.add_handler(CommandHandler("reset_week", cmd_reset_week))
     app.add_handler(CommandHandler("reset_all", cmd_reset_all))
+    app.add_handler(CommandHandler("clearpolls", cmd_clearpolls))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("count", cmd_count))
     app.add_handler(CommandHandler("polls", cmd_polls))
