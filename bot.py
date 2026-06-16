@@ -188,23 +188,47 @@ def norm(s):
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
+def in_scoring_group(update):
+    """True only if the update happens in the configured scoring group.
+    Earning actions (check-in/talk/invite/predict-vote) are valid ONLY there.
+    If GROUP_CHAT_ID is not set, fall back to allowing (so the bot still works
+    before configuration)."""
+    if not GROUP_CHAT_ID:
+        return True
+    chat = update.effective_chat
+    return chat is not None and chat.id == GROUP_CHAT_ID
+
 # ----------------------------------------------------------------------------
 # User commands
 # ----------------------------------------------------------------------------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    group_line = (
+        f"\n⚠️ Points are only earned inside our official group: https://t.me/{GROUP_USERNAME}\n"
+        if GROUP_USERNAME else
+        "\n⚠️ Points are only earned inside our official community group.\n"
+    )
     await update.message.reply_text(
         "⚽ Welcome to the Perpvia Pioneer Points Race!\n\n"
-        "Common commands:\n"
-        "/checkin - Daily check-in (+5, +20 bonus on a 7-day streak)\n"
+        "Here in private chat you can check your progress:\n"
         "/me - View my points\n"
         "/rank - View my ranking\n"
-        "/invite - Get my personal invite link\n\n"
+        "/invite - Get my personal invite link\n"
+        + group_line +
+        "To EARN points (check-in, chat, predictions), do it in the group:\n"
+        "/checkin - Daily check-in (+5, +20 bonus on a 7-day streak)\n\n"
         "Complete daily tasks, join the World Cup predictions, "
         "and climb the leaderboard to win the prize pool!"
     )
 
 async def cmd_checkin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
+    # Earning only allowed in the designated group
+    if not in_scoring_group(update):
+        await update.message.reply_text(
+            "📍 Check-in only counts in the official community group.\n"
+            "👉 Join and check in here: " + (f"https://t.me/{GROUP_USERNAME}" if GROUP_USERNAME else "the Perpvia Pioneer Hub")
+        )
+        return
     ensure_user(u.id, u.username or u.first_name)
     conn = db(); c = conn.cursor()
     row = c.execute("SELECT last_checkin, checkin_streak FROM users WHERE user_id=?", (u.id,)).fetchone()
@@ -398,6 +422,9 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------------------
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.effective_user:
+        return
+    # Talk points only count in the designated group (silent elsewhere)
+    if not in_scoring_group(update):
         return
     u = update.effective_user
     ensure_user(u.id, u.username or u.first_name)
