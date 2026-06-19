@@ -116,9 +116,17 @@ def init_db():
     c.execute("""
         CREATE TABLE IF NOT EXISTS predict_polls (
             poll_id TEXT PRIMARY KEY, match TEXT, stage TEXT,
-            options TEXT, settled INTEGER DEFAULT 0, day TEXT
+            options TEXT, settled INTEGER DEFAULT 0, day TEXT,
+            deadline TEXT, chat_id INTEGER, message_id INTEGER, closed INTEGER DEFAULT 0
         )
     """)
+    # Safe migrations for DBs created before these columns existed
+    for col, decl in [("deadline","TEXT"),("chat_id","INTEGER"),
+                      ("message_id","INTEGER"),("closed","INTEGER DEFAULT 0")]:
+        try:
+            c.execute(f"ALTER TABLE predict_polls ADD COLUMN {col} {decl}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     c.execute("""
         CREATE TABLE IF NOT EXISTS predict_votes (
             poll_id TEXT, user_id INTEGER, choice INTEGER,
@@ -449,8 +457,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------------------
 async def job_credit_invites(ctx: ContextTypes.DEFAULT_TYPE):
     conn = db(); c = conn.cursor()
+    # invited user must have checked in at least once (last_checkin not null)
     rows = c.execute(
-        "SELECT user_id, invited_by, joined_at, had_activity, invite_credited "
+        "SELECT user_id, invited_by, joined_at, last_checkin, invite_credited "
         "FROM users WHERE invited_by IS NOT NULL AND invite_credited=0"
     ).fetchall()
     now = dt.datetime.utcnow()
@@ -461,7 +470,7 @@ async def job_credit_invites(ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             continue
         hours = (now - joined).total_seconds() / 3600
-        if hours >= INVITE_HOLD_HOURS and r["had_activity"] == 1:
+        if hours >= INVITE_HOLD_HOURS and r["last_checkin"]:
             c.execute("UPDATE users SET invite_credited=1 WHERE user_id=?", (r["user_id"],))
             conn.commit()
             add_points(r["invited_by"], PTS_INVITE)
@@ -470,27 +479,72 @@ async def job_credit_invites(ctx: ContextTypes.DEFAULT_TYPE):
     if credited:
         log.info(f"Invite credit: awarded {credited} valid invite(s) this round")
 
+async def job_close_polls(ctx: ContextTypes.DEFAULT_TYPE):
+    """Every minute: close any poll whose deadline has passed so no one can
+    vote after kickoff."""
+    now = dt.datetime.utcnow()
+    conn = db(); c = conn.cursor()
+    rows = c.execute(
+        "SELECT poll_id, chat_id, message_id, deadline FROM predict_polls "
+        "WHERE deadline IS NOT NULL AND closed=0 AND settled=0"
+    ).fetchall()
+    conn.close()
+    for r in rows:
+        try:
+            dl = dt.datetime.fromisoformat(r["deadline"])
+        except Exception:
+            continue
+        if now >= dl and r["chat_id"] and r["message_id"]:
+            try:
+                await ctx.bot.stop_poll(chat_id=r["chat_id"], message_id=r["message_id"])
+            except Exception as e:
+                log.warning(f"stop_poll failed for {r['poll_id']}: {e}")
+            conn = db(); conn.execute(
+                "UPDATE predict_polls SET closed=1 WHERE poll_id=?", (r["poll_id"],)
+            ); conn.commit(); conn.close()
+            log.info(f"Auto-closed poll {r['poll_id']} at deadline")
+
 # ----------------------------------------------------------------------------
 # Predictions
 # ----------------------------------------------------------------------------
 async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/predict group|knockout <match> <opt1> <opt2> [opt3]
-    e.g. /predict group ARGvsFRA ARG_win Draw FRA_win
-    Stage words containing 'knockout' or 'ko' use the knockout point value.
+    """/predict <stage> <match> [deadline] <opt1> <opt2> [opt3]
+    deadline is optional, UTC, format YYYY-MM-DDTHH:MM (e.g. 2026-06-17T17:00).
+    If given, the bot auto-closes the poll at that time so no one can vote after
+    kickoff.
+    e.g. /predict group ARGvsFRA 2026-06-17T17:00 ARG_win Draw FRA_win
+         /predict group ARGvsFRA ARG_win Draw FRA_win   (no deadline)
     """
     if not is_admin(update.effective_user.id):
         return
     parts = update.message.text.split()
-    # parts[0]=/predict, [1]=stage, [2]=match, [3:]=options
     if len(parts) < 5:
         await update.message.reply_text(
-            "Usage: /predict <stage> <match> <opt1> <opt2> [opt3]\n"
-            "e.g. /predict group ARGvsFRA ARG_win Draw FRA_win"
+            "Usage: /predict <stage> <match> [deadline] <opt1> <opt2> [opt3]\n"
+            "deadline optional, UTC: YYYY-MM-DDTHH:MM\n"
+            "e.g. /predict group ARGvsFRA 2026-06-17T17:00 ARG_win Draw FRA_win"
         )
         return
     stage = parts[1]
     match = parts[2]
-    options = parts[3:]
+    rest = parts[3:]
+    # Detect optional deadline as the first item of rest
+    deadline = None
+    deadline_dt = None
+    def parse_deadline(s):
+        for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y/%m/%dT%H:%M"):
+            try:
+                return dt.datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        return None
+    maybe = parse_deadline(rest[0])
+    if maybe is not None:
+        deadline_dt = maybe
+        deadline = deadline_dt.isoformat()
+        options = rest[1:]
+    else:
+        options = rest
     if len(options) < 2:
         await update.message.reply_text("Need at least 2 options (2-way win or 3-way with draw).")
         return
@@ -505,12 +559,21 @@ async def cmd_predict(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         allows_multiple_answers=False,
     )
     conn = db(); conn.execute(
-        "INSERT INTO predict_polls (poll_id, match, stage, options, day) VALUES (?,?,?,?,?)",
-        (sent.poll.id, match, stage, "|".join(options), today_str()),
+        "INSERT INTO predict_polls (poll_id, match, stage, options, day, deadline, chat_id, message_id) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (sent.poll.id, match, stage, "|".join(options), today_str(),
+         deadline, update.effective_chat.id, sent.message_id),
     ); conn.commit(); conn.close()
-    await update.message.reply_text(
-        f"✅ Poll opened: {match}. Voting +{PTS_PREDICT_JOIN}, correct guess earns more."
-    )
+    if deadline_dt:
+        await update.message.reply_text(
+            f"✅ Poll opened: {match}. Voting +{PTS_PREDICT_JOIN}, correct guess earns more.\n"
+            f"⏰ Auto-closes at {deadline_dt.strftime('%Y-%m-%d %H:%M')} UTC."
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ Poll opened: {match}. Voting +{PTS_PREDICT_JOIN}, correct guess earns more.\n"
+            f"(No deadline set — close it manually or settle to lock it.)"
+        )
 
 async def on_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ans = update.poll_answer
@@ -519,9 +582,20 @@ async def on_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     poll_id = ans.poll_id
     user = ans.user
     conn = db(); c = conn.cursor()
-    poll = c.execute("SELECT poll_id, settled FROM predict_polls WHERE poll_id=?", (poll_id,)).fetchone()
+    poll = c.execute(
+        "SELECT poll_id, settled, closed, deadline FROM predict_polls WHERE poll_id=?", (poll_id,)
+    ).fetchone()
     if not poll or poll["settled"] == 1:
         conn.close(); return
+    # Reject if poll is closed or past its deadline (no points, no record)
+    if poll["closed"] == 1:
+        conn.close(); return
+    if poll["deadline"]:
+        try:
+            if dt.datetime.utcnow() >= dt.datetime.fromisoformat(poll["deadline"]):
+                conn.close(); return
+        except Exception:
+            pass
     ensure_user(user.id, user.username or user.first_name)
     exists = c.execute(
         "SELECT 1 FROM predict_votes WHERE poll_id=? AND user_id=?", (poll_id, user.id)
@@ -817,6 +891,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     app.job_queue.run_repeating(job_credit_invites, interval=3600, first=60)
+    app.job_queue.run_repeating(job_close_polls, interval=60, first=30)
 
     log.info("Perpvia bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
