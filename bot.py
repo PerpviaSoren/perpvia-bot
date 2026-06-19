@@ -765,7 +765,7 @@ async def cmd_reset_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     parts = update.message.text.split()
-    if len(parts) < 2 or parts[1] != "CONFIRM":
+    if len(parts) < 2 or parts[1].strip().upper() != "CONFIRM":
         await update.message.reply_text(
             "⚠️ This will PERMANENTLY DELETE all users, points, predictions and "
             "invite links. This cannot be undone.\n\n"
@@ -788,7 +788,8 @@ async def cmd_clearpolls(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     parts = update.message.text.split()
-    if len(parts) < 2 or parts[1] != "CONFIRM":
+    confirmed = len(parts) >= 2 and parts[1].strip().upper() == "CONFIRM"
+    if not confirmed:
         await update.message.reply_text(
             "⚠️ This deletes ALL prediction polls and their vote records "
             "(useful to clear test/duplicate polls). Points already awarded stay.\n\n"
