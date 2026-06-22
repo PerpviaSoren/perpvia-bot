@@ -108,6 +108,7 @@ def init_db():
         """CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY, username TEXT,
             total_points INTEGER DEFAULT 0, week_points INTEGER DEFAULT 0,
+            total_invites INTEGER DEFAULT 0, week_invites INTEGER DEFAULT 0,
             joined_at TEXT, invited_by INTEGER, invite_credited INTEGER DEFAULT 0,
             last_checkin TEXT, checkin_streak INTEGER DEFAULT 0, had_activity INTEGER DEFAULT 0
         )""",
@@ -138,7 +139,9 @@ def init_db():
         db_write(s)
     # Safe migrations
     for col, decl in [("deadline","TEXT"),("chat_id","INTEGER"),
-                      ("message_id","INTEGER"),("closed","INTEGER DEFAULT 0")]:
+                      ("message_id","INTEGER"),("closed","INTEGER DEFAULT 0"),
+                      ("total_invites","INTEGER DEFAULT 0"),
+                      ("week_invites","INTEGER DEFAULT 0")]:
         try: db_write(f"ALTER TABLE predict_polls ADD COLUMN {col} {decl}")
         except: pass
     log.info("DB initialised")
@@ -326,6 +329,8 @@ async def job_credit_invites(ctx: ContextTypes.DEFAULT_TYPE):
         if (now-joined).total_seconds()/3600 >= INVITE_HOLD_HOURS and r["last_checkin"]:
             db_write("UPDATE users SET invite_credited=1 WHERE user_id=?",(r["user_id"],))
             add_points(r["invited_by"], PTS_INVITE)
+            db_write("UPDATE users SET total_invites=total_invites+1, week_invites=week_invites+1 WHERE user_id=?",
+                     (r["invited_by"],))
             credited+=1
     if credited: log.info(f"Invite credit: {credited} valid invite(s)")
 
@@ -499,10 +504,30 @@ async def cmd_top10(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{medals[i]} {name} - {r['p']} pts")
     await update.message.reply_text("\n".join(lines))
 
+async def cmd_invitetop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/invitetop → total invite leaderboard
+    /invitetop week → weekly invite leaderboard"""
+    if not is_admin(update.effective_user.id): return
+    arg = ctx.args[0] if ctx.args else "total"
+    col = "week_invites" if arg == "week" else "total_invites"
+    title = "Weekly Invite Leaderboard" if arg == "week" else "Overall Invite Leaderboard"
+    rows = db_read(
+        f"SELECT username, {col} AS n FROM users WHERE {col}>0 ORDER BY {col} DESC LIMIT 10"
+    )
+    if not rows:
+        await update.message.reply_text(f"No invite data yet for {title}."); return
+    medals = ["🥇","🥈","🥉"] + ["▫️"]*7
+    lines = [f"🤝 {title} - TOP 10\n"]
+    for i, r in enumerate(rows):
+        name = f"@{r['username']}" if r["username"] else "Anonymous"
+        lines.append(f"{medals[i]} {name} - {r['n']} invite(s)")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_reset_week(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
-    db_write("UPDATE users SET week_points=0")
-    await update.message.reply_text("✅ Weekly points reset. New week begins! (Overall totals unaffected.)")
+    db_write("UPDATE users SET week_points=0, week_invites=0")
+    await update.message.reply_text("✅ Weekly points and invite counts reset. New week begins! (Overall totals unaffected.)")
 
 async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
@@ -559,6 +584,7 @@ def main():
     app.add_handler(CommandHandler("polls",cmd_polls))
     app.add_handler(CommandHandler("award",cmd_award))
     app.add_handler(CommandHandler("top10",cmd_top10))
+    app.add_handler(CommandHandler("invitetop",cmd_invitetop))
     app.add_handler(CommandHandler("reset_week",cmd_reset_week))
     app.add_handler(CommandHandler("export",cmd_export))
     app.add_handler(CommandHandler("count",cmd_count))
