@@ -137,12 +137,17 @@ def init_db():
     ]
     for s in stmts:
         db_write(s)
-    # Safe migrations
+    # Safe migrations — predict_polls columns
     for col, decl in [("deadline","TEXT"),("chat_id","INTEGER"),
-                      ("message_id","INTEGER"),("closed","INTEGER DEFAULT 0"),
-                      ("total_invites","INTEGER DEFAULT 0"),
-                      ("week_invites","INTEGER DEFAULT 0")]:
+                      ("message_id","INTEGER"),("closed","INTEGER DEFAULT 0")]:
         try: db_write(f"ALTER TABLE predict_polls ADD COLUMN {col} {decl}")
+        except: pass
+    # Safe migrations — users invite-count columns
+    # (FIX: these were previously ALTERed onto predict_polls by mistake,
+    #  so old DBs were missing them on the users table -> /invitetop returned empty.)
+    for col, decl in [("total_invites","INTEGER DEFAULT 0"),
+                      ("week_invites","INTEGER DEFAULT 0")]:
+        try: db_write(f"ALTER TABLE users ADD COLUMN {col} {decl}")
         except: pass
     log.info("DB initialised")
 
