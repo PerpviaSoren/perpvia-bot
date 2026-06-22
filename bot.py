@@ -84,12 +84,31 @@ log = logging.getLogger("perpvia")
 # ----------------------------------------------------------------------------
 import sqlite3
 
+import threading
+_db_lock = threading.Lock()
+
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=15, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")   # WAL mode: much better concurrency
-    conn.execute("PRAGMA busy_timeout=15000") # 15s busy wait before giving up
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+    except Exception:
+        pass
     return conn
+
+def db_execute(sql, params=()):
+    """Thread-safe single execute + commit. Use for all writes."""
+    with _db_lock:
+        conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            r = conn.execute(sql, params)
+            conn.commit()
+            return r
+        finally:
+            conn.close()
 
 def init_db():
     conn = db()
@@ -157,28 +176,38 @@ def init_db():
     conn.close()
 
 def ensure_user(user_id, username, invited_by=None):
-    conn = db(); c = conn.cursor()
-    row = c.execute("SELECT user_id, invited_by FROM users WHERE user_id=?", (user_id,)).fetchone()
-    if not row:
-        c.execute(
-            "INSERT INTO users (user_id, username, joined_at, invited_by) VALUES (?,?,?,?)",
-            (user_id, username, dt.datetime.utcnow().isoformat(), invited_by),
-        )
-    else:
-        c.execute("UPDATE users SET username=? WHERE user_id=?", (username, user_id))
-        # Backfill inviter if we learn it later and it wasn't set before
-        if invited_by and not row["invited_by"]:
-            c.execute("UPDATE users SET invited_by=? WHERE user_id=?", (invited_by, user_id))
-    conn.commit(); conn.close()
+    with _db_lock:
+        conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            c = conn.cursor()
+            row = c.execute("SELECT user_id, invited_by FROM users WHERE user_id=?", (user_id,)).fetchone()
+            if not row:
+                c.execute(
+                    "INSERT INTO users (user_id, username, joined_at, invited_by) VALUES (?,?,?,?)",
+                    (user_id, username, dt.datetime.utcnow().isoformat(), invited_by),
+                )
+            else:
+                c.execute("UPDATE users SET username=? WHERE user_id=?", (username, user_id))
+                if invited_by and not row["invited_by"]:
+                    c.execute("UPDATE users SET invited_by=? WHERE user_id=?", (invited_by, user_id))
+            conn.commit()
+        finally:
+            conn.close()
 
 def add_points(user_id, pts):
-    """Add to both total and weekly (dual-track)."""
-    conn = db(); c = conn.cursor()
-    c.execute(
-        "UPDATE users SET total_points=total_points+?, week_points=week_points+? WHERE user_id=?",
-        (pts, pts, user_id),
-    )
-    conn.commit(); conn.close()
+    """Add to both total and weekly (dual-track). Thread-safe."""
+    with _db_lock:
+        conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "UPDATE users SET total_points=total_points+?, week_points=week_points+? WHERE user_id=?",
+                (pts, pts, user_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 def today_str():
     return dt.date.today().isoformat()
