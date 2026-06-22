@@ -57,9 +57,8 @@ try:
 except ValueError:
     GROUP_CHAT_ID = None
 
-# Database file path (use a persistent volume on the host, otherwise data is
-# lost on restart - see deployment notes).
-DB_PATH = os.environ.get("DB_PATH", "perpvia.db")
+# PostgreSQL URL from Railway (set DATABASE_URL env var)
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 # Scoring parameters (change values here, no need to touch logic)
 PTS_CHECKIN = 5
@@ -82,33 +81,14 @@ log = logging.getLogger("perpvia")
 # ----------------------------------------------------------------------------
 # Data layer: SQLite, zero extra dependencies, single file.
 # ----------------------------------------------------------------------------
-import sqlite3
-
-import threading
-_db_lock = threading.Lock()
+import psycopg2
+import psycopg2.extras
 
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
-    except Exception:
-        pass
+    """Get a new PostgreSQL connection. Fully concurrent, no locking needed."""
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn.autocommit = False
     return conn
-
-def db_execute(sql, params=()):
-    """Thread-safe single execute + commit. Use for all writes."""
-    with _db_lock:
-        conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            r = conn.execute(sql, params)
-            conn.commit()
-            return r
-        finally:
-            conn.close()
 
 def init_db():
     conn = db()
@@ -146,7 +126,7 @@ def init_db():
                       ("message_id","INTEGER"),("closed","INTEGER DEFAULT 0")]:
         try:
             c.execute(f"ALTER TABLE predict_polls ADD COLUMN {col} {decl}")
-        except sqlite3.OperationalError:
+        except Exception:
             pass  # column already exists
     c.execute("""
         CREATE TABLE IF NOT EXISTS predict_votes (
@@ -176,38 +156,30 @@ def init_db():
     conn.close()
 
 def ensure_user(user_id, username, invited_by=None):
-    with _db_lock:
-        conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            c = conn.cursor()
-            row = c.execute("SELECT user_id, invited_by FROM users WHERE user_id=?", (user_id,)).fetchone()
+    with db() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT user_id, invited_by FROM users WHERE user_id=%s", (user_id,))
+            row = c.fetchone()
             if not row:
                 c.execute(
-                    "INSERT INTO users (user_id, username, joined_at, invited_by) VALUES (?,?,?,?)",
+                    "INSERT INTO users (user_id, username, joined_at, invited_by) VALUES (%s,%s,%s,%s)",
                     (user_id, username, dt.datetime.utcnow().isoformat(), invited_by),
                 )
             else:
-                c.execute("UPDATE users SET username=? WHERE user_id=?", (username, user_id))
+                c.execute("UPDATE users SET username=%s WHERE user_id=%s", (username, user_id))
                 if invited_by and not row["invited_by"]:
-                    c.execute("UPDATE users SET invited_by=? WHERE user_id=?", (invited_by, user_id))
-            conn.commit()
-        finally:
-            conn.close()
+                    c.execute("UPDATE users SET invited_by=%s WHERE user_id=%s", (invited_by, user_id))
+        conn.commit()
 
 def add_points(user_id, pts):
-    """Add to both total and weekly (dual-track). Thread-safe."""
-    with _db_lock:
-        conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(
-                "UPDATE users SET total_points=total_points+?, week_points=week_points+? WHERE user_id=?",
+    """Add to both total and weekly (dual-track)."""
+    with db() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "UPDATE users SET total_points=total_points+%s, week_points=week_points+%s WHERE user_id=%s",
                 (pts, pts, user_id),
             )
-            conn.commit()
-        finally:
-            conn.close()
+        conn.commit()
 
 def today_str():
     return dt.date.today().isoformat()
@@ -270,7 +242,7 @@ async def cmd_checkin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     ensure_user(u.id, u.username or u.first_name)
     conn = db(); c = conn.cursor()
-    row = c.execute("SELECT last_checkin, checkin_streak FROM users WHERE user_id=?", (u.id,)).fetchone()
+    row = c.execute("SELECT last_checkin, checkin_streak FROM users WHERE user_id=%s", (u.id,)).fetchone()
     today = today_str()
     if row["last_checkin"] == today:
         conn.close()
@@ -280,7 +252,7 @@ async def cmd_checkin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     streak = (row["checkin_streak"] or 0) + 1 if row["last_checkin"] == yesterday else 1
     bonus = PTS_CHECKIN_STREAK7 if streak % 7 == 0 else 0
     c.execute(
-        "UPDATE users SET last_checkin=?, checkin_streak=?, had_activity=1 WHERE user_id=?",
+        "UPDATE users SET last_checkin=%s, checkin_streak=%s, had_activity=1 WHERE user_id=%s",
         (today, streak, u.id),
     )
     conn.commit(); conn.close()
@@ -295,7 +267,7 @@ async def cmd_me(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ensure_user(u.id, u.username or u.first_name)
     conn = db()
     row = conn.execute(
-        "SELECT total_points, week_points, checkin_streak FROM users WHERE user_id=?", (u.id,)
+        "SELECT total_points, week_points, checkin_streak FROM users WHERE user_id=%s", (u.id,)
     ).fetchone()
     conn.close()
     await update.message.reply_text(
@@ -326,7 +298,7 @@ async def cmd_invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # If we've already made a link for this user, reuse it (one link per user).
     conn = db()
     existing = conn.execute(
-        "SELECT invite_link FROM invite_links WHERE inviter_id=?", (u.id,)
+        "SELECT invite_link FROM invite_links WHERE inviter_id=%s", (u.id,)
     ).fetchone()
     conn.close()
     if existing:
@@ -361,7 +333,7 @@ async def cmd_invite(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     conn = db()
     conn.execute(
-        "INSERT OR REPLACE INTO invite_links (invite_link, inviter_id, created_at) VALUES (?,?,?)",
+        "INSERT INTO invite_links (invite_link, inviter_id, created_at) VALUES (%s,%s,%s) ON CONFLICT (invite_link) DO UPDATE SET inviter_id=EXCLUDED.inviter_id, created_at=EXCLUDED.created_at",
         (link_obj.invite_link, u.id, dt.datetime.utcnow().isoformat()),
     )
     conn.commit(); conn.close()
@@ -397,7 +369,7 @@ async def cmd_start_with_payload(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
         # also stash as pending in case the user row already existed
         conn = db()
         conn.execute(
-            "INSERT OR IGNORE INTO pending_invites (invitee_id, inviter_id, ts) VALUES (?,?,?)",
+            "INSERT INTO pending_invites (invitee_id, inviter_id, ts) VALUES (%s,%s,%s) ON CONFLICT (invitee_id) DO NOTHING",
             (u.id, invited_by, dt.datetime.utcnow().isoformat()),
         )
         conn.commit(); conn.close()
@@ -435,7 +407,7 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if res.invite_link and res.invite_link.invite_link:
         conn = db()
         row = conn.execute(
-            "SELECT inviter_id FROM invite_links WHERE invite_link=?",
+            "SELECT inviter_id FROM invite_links WHERE invite_link=%s",
             (res.invite_link.invite_link,),
         ).fetchone()
         conn.close()
@@ -445,7 +417,7 @@ async def on_chat_member(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if inviter is None:
         conn = db()
         p = conn.execute(
-            "SELECT inviter_id FROM pending_invites WHERE invitee_id=?", (uid,)
+            "SELECT inviter_id FROM pending_invites WHERE invitee_id=%s", (uid,)
         ).fetchone()
         conn.close()
         if p:
@@ -474,12 +446,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "ON CONFLICT(user_id, day) DO UPDATE SET count=count+1",
         (u.id, day),
     )
-    c.execute("UPDATE users SET had_activity=1 WHERE user_id=?", (u.id,))
-    row = c.execute("SELECT count, credited FROM talk WHERE user_id=? AND day=?", (u.id, day)).fetchone()
+    c.execute("UPDATE users SET had_activity=1 WHERE user_id=%s", (u.id,))
+    row = c.execute("SELECT count, credited FROM talk WHERE user_id=%s AND day=%s", (u.id, day)).fetchone()
     conn.commit(); conn.close()
     if row["count"] >= TALK_THRESHOLD and row["credited"] == 0:
         conn = db(); conn.execute(
-            "UPDATE talk SET credited=1 WHERE user_id=? AND day=?", (u.id, day)
+            "UPDATE talk SET credited=1 WHERE user_id=%s AND day=%s", (u.id, day)
         ); conn.commit(); conn.close()
         add_points(u.id, PTS_TALK_DAILY)
 
@@ -502,7 +474,7 @@ async def job_credit_invites(ctx: ContextTypes.DEFAULT_TYPE):
             continue
         hours = (now - joined).total_seconds() / 3600
         if hours >= INVITE_HOLD_HOURS and r["last_checkin"]:
-            c.execute("UPDATE users SET invite_credited=1 WHERE user_id=?", (r["user_id"],))
+            c.execute("UPDATE users SET invite_credited=1 WHERE user_id=%s", (r["user_id"],))
             conn.commit()
             add_points(r["invited_by"], PTS_INVITE)
             credited += 1
@@ -531,7 +503,7 @@ async def job_close_polls(ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 log.warning(f"stop_poll failed for {r['poll_id']}: {e}")
             conn = db(); conn.execute(
-                "UPDATE predict_polls SET closed=1 WHERE poll_id=?", (r["poll_id"],)
+                "UPDATE predict_polls SET closed=1 WHERE poll_id=%s", (r["poll_id"],)
             ); conn.commit(); conn.close()
             log.info(f"Auto-closed poll {r['poll_id']} at deadline")
 
@@ -614,7 +586,7 @@ async def on_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = ans.user
     conn = db(); c = conn.cursor()
     poll = c.execute(
-        "SELECT poll_id, settled, closed, deadline FROM predict_polls WHERE poll_id=?", (poll_id,)
+        "SELECT poll_id, settled, closed, deadline FROM predict_polls WHERE poll_id=%s", (poll_id,)
     ).fetchone()
     if not poll or poll["settled"] == 1:
         conn.close(); return
@@ -629,10 +601,10 @@ async def on_poll_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
     ensure_user(user.id, user.username or user.first_name)
     exists = c.execute(
-        "SELECT 1 FROM predict_votes WHERE poll_id=? AND user_id=?", (poll_id, user.id)
+        "SELECT 1 FROM predict_votes WHERE poll_id=%s AND user_id=%s", (poll_id, user.id)
     ).fetchone()
     c.execute(
-        "INSERT OR REPLACE INTO predict_votes (poll_id, user_id, choice) VALUES (?,?,?)",
+        "INSERT INTO predict_votes (poll_id, user_id, choice) VALUES (%s,%s,%s) ON CONFLICT (poll_id, user_id) DO UPDATE SET choice=EXCLUDED.choice",
         (poll_id, user.id, ans.option_ids[0]),
     )
     conn.commit(); conn.close()
@@ -653,7 +625,7 @@ async def cmd_settle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn = db(); c = conn.cursor()
     # First try exact match, then fall back to normalized (emoji/space-insensitive)
     poll = c.execute(
-        "SELECT poll_id, match, options, stage, settled FROM predict_polls WHERE match=? ORDER BY rowid DESC", (match,)
+        "SELECT poll_id, match, options, stage, settled FROM predict_polls WHERE match=%s ORDER BY rowid DESC", (match,)
     ).fetchone()
     if not poll:
         # normalized fallback: scan open polls and compare normalized names
@@ -701,7 +673,7 @@ async def cmd_settle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     stage_l = poll["stage"].lower()
     is_ko = ("knockout" in stage_l) or ("ko" in stage_l) or ("淘汰" in poll["stage"])
     hit_pts = PTS_PREDICT_HIT_KO if is_ko else PTS_PREDICT_HIT_GROUP
-    votes = c.execute("SELECT user_id, choice FROM predict_votes WHERE poll_id=?", (poll["poll_id"],)).fetchall()
+    votes = c.execute("SELECT user_id, choice FROM predict_votes WHERE poll_id=%s", (poll["poll_id"],)).fetchall()
     hit_users, miss_users = [], []
     for v in votes:
         if v["choice"] == correct_idx:
@@ -711,15 +683,15 @@ async def cmd_settle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     streak_bonus_count = 0
     for uid in hit_users:
         add_points(uid, hit_pts)
-        row = c.execute("SELECT streak FROM predict_streak WHERE user_id=?", (uid,)).fetchone()
+        row = c.execute("SELECT streak FROM predict_streak WHERE user_id=%s", (uid,)).fetchone()
         s = (row["streak"] if row else 0) + 1
-        c.execute("INSERT OR REPLACE INTO predict_streak (user_id, streak) VALUES (?,?)", (uid, s))
+        c.execute("INSERT INTO predict_streak (user_id, streak) VALUES (%s,%s) ON CONFLICT (user_id) DO UPDATE SET streak=EXCLUDED.streak", (uid, s))
         if s % 3 == 0:
             add_points(uid, PTS_PREDICT_STREAK3)
             streak_bonus_count += 1
     for uid in miss_users:
-        c.execute("INSERT OR REPLACE INTO predict_streak (user_id, streak) VALUES (?,0)", (uid,))
-    c.execute("UPDATE predict_polls SET settled=1 WHERE poll_id=?", (poll["poll_id"],))
+        c.execute("INSERT INTO predict_streak (user_id, streak) VALUES (%s,0) ON CONFLICT (user_id) DO UPDATE SET streak=0", (uid,))
+    c.execute("UPDATE predict_polls SET settled=1 WHERE poll_id=%s", (poll["poll_id"],))
     conn.commit(); conn.close()
     await update.message.reply_text(
         f"✅ {match} settled! Correct answer: {correct}\n"
@@ -752,7 +724,7 @@ async def cmd_award(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("Points must be a number."); return
         conn = db()
-        row = conn.execute("SELECT user_id FROM users WHERE username=?", (target_name,)).fetchone()
+        row = conn.execute("SELECT user_id FROM users WHERE username=%s", (target_name,)).fetchone()
         conn.close()
         if not row:
             await update.message.reply_text(
