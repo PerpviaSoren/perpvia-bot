@@ -22,11 +22,12 @@ import datetime as dt
 import sqlite3
 import queue
 import threading
+import secrets
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ChatMemberHandler,
-    PollAnswerHandler, ContextTypes, filters
+    PollAnswerHandler, CallbackQueryHandler, ContextTypes, filters
 )
 
 # ----------------------------------------------------------------------------
@@ -134,6 +135,25 @@ def init_db():
         """CREATE TABLE IF NOT EXISTS invite_links (
             invite_link TEXT PRIMARY KEY, inviter_id INTEGER, created_at TEXT
         )""",
+        """CREATE TABLE IF NOT EXISTS lotteries (
+            lottery_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            min_points INTEGER DEFAULT 0,
+            max_winners INTEGER DEFAULT 1,
+            point_type TEXT DEFAULT 'total',
+            status TEXT DEFAULT 'open',
+            created_at TEXT,
+            drawn_at TEXT,
+            chat_id INTEGER,
+            message_id INTEGER
+        )""",
+        """CREATE TABLE IF NOT EXISTS lottery_entries (
+            lottery_id INTEGER,
+            user_id INTEGER,
+            username TEXT,
+            joined_at TEXT,
+            PRIMARY KEY (lottery_id, user_id)
+        )""",
     ]
     for s in stmts:
         db_write(s)
@@ -148,6 +168,10 @@ def init_db():
     for col, decl in [("total_invites","INTEGER DEFAULT 0"),
                       ("week_invites","INTEGER DEFAULT 0")]:
         try: db_write(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+        except: pass
+    # Safe migrations — lotteries columns
+    for col, decl in [("chat_id","INTEGER"), ("message_id","INTEGER")]:
+        try: db_write(f"ALTER TABLE lotteries ADD COLUMN {col} {decl}")
         except: pass
     log.info("DB initialised")
 
@@ -472,6 +496,307 @@ async def cmd_polls(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 # ----------------------------------------------------------------------------
+# Lottery - button-based draw system
+# ----------------------------------------------------------------------------
+def lottery_keyboard(lottery_id, status="open"):
+    if status != "open":
+        return None
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 Join Lottery", callback_data=f"lottery_join:{lottery_id}")],
+        [InlineKeyboardButton("🏆 Draw Winners (Admin)", callback_data=f"lottery_draw:{lottery_id}")],
+    ])
+
+def lottery_text(lottery_id):
+    lot = db_read_one(
+        "SELECT lottery_id,title,min_points,max_winners,point_type,status FROM lotteries WHERE lottery_id=?",
+        (lottery_id,)
+    )
+    if not lot:
+        return "Lottery not found."
+    count_row = db_read_one("SELECT COUNT(*) AS n FROM lottery_entries WHERE lottery_id=?", (lottery_id,))
+    joined_count = count_row["n"] if count_row else 0
+    point_label = "total points" if lot["point_type"] == "total" else "weekly points"
+    status_label = "Open" if lot["status"] == "open" else lot["status"].capitalize()
+    action_line = "Click the button below to join." if lot["status"] == "open" else "This lottery is closed."
+    return (
+        f"🎁 {lot['title']} Lottery\n\n"
+        f"Status: {status_label}\n"
+        f"Requirement: {lot['min_points']}+ {point_label}\n"
+        f"Winners: {lot['max_winners']}\n"
+        f"Participants: {joined_count}\n\n"
+        f"{action_line}"
+    )
+
+async def refresh_lottery_message(ctx: ContextTypes.DEFAULT_TYPE, lottery_id):
+    lot = db_read_one(
+        "SELECT lottery_id,status,chat_id,message_id FROM lotteries WHERE lottery_id=?",
+        (lottery_id,)
+    )
+    if not lot or not lot["chat_id"] or not lot["message_id"]:
+        return
+    try:
+        await ctx.bot.edit_message_text(
+            chat_id=lot["chat_id"],
+            message_id=lot["message_id"],
+            text=lottery_text(lottery_id),
+            reply_markup=lottery_keyboard(lottery_id, lot["status"])
+        )
+    except Exception as e:
+        # Usually caused by "message is not modified"; safe to ignore.
+        log.debug(f"refresh lottery message: {e}")
+
+async def draw_lottery(ctx: ContextTypes.DEFAULT_TYPE, lottery_id, reply_chat_id=None, source_message=None):
+    lot = db_read_one(
+        "SELECT lottery_id,title,min_points,max_winners,point_type,status,chat_id,message_id "
+        "FROM lotteries WHERE lottery_id=?",
+        (lottery_id,)
+    )
+    if not lot:
+        return "Lottery not found."
+    if lot["status"] != "open":
+        return "This lottery has already been drawn or closed."
+
+    rows = db_read(
+        "SELECT e.user_id,e.username,u.total_points,u.week_points "
+        "FROM lottery_entries e "
+        "JOIN users u ON e.user_id=u.user_id "
+        "WHERE e.lottery_id=?",
+        (lottery_id,)
+    )
+
+    eligible = []
+    for r in rows:
+        pts = r["total_points"] if lot["point_type"] == "total" else r["week_points"]
+        if pts >= lot["min_points"]:
+            eligible.append(r)
+
+    if not eligible:
+        return "No eligible participants for this lottery."
+
+    winner_count = min(lot["max_winners"], len(eligible))
+    pool = list(eligible)
+    winners = []
+    for _ in range(winner_count):
+        idx = secrets.randbelow(len(pool))
+        winners.append(pool.pop(idx))
+
+    db_write(
+        "UPDATE lotteries SET status='drawn', drawn_at=? WHERE lottery_id=?",
+        (dt.datetime.utcnow().isoformat(), lottery_id)
+    )
+
+    point_label = "total points" if lot["point_type"] == "total" else "weekly points"
+    lines = [
+        f"🎉 Lottery Result",
+        f"Prize: {lot['title']}",
+        f"Requirement: {lot['min_points']}+ {point_label}",
+        f"Eligible participants: {len(eligible)}",
+        "",
+        "🏆 Winner(s):"
+    ]
+    for i, w in enumerate(winners, start=1):
+        name = f"@{w['username']}" if w["username"] else f"User {w['user_id']}"
+        pts = w["total_points"] if lot["point_type"] == "total" else w["week_points"]
+        lines.append(f"{i}. {name} - {pts} pts")
+    result_text = "\n".join(lines)
+
+    await refresh_lottery_message(ctx, lottery_id)
+    target_chat_id = reply_chat_id or lot["chat_id"]
+    if target_chat_id:
+        await ctx.bot.send_message(chat_id=target_chat_id, text=result_text)
+    elif source_message:
+        await source_message.reply_text(result_text)
+    return None
+
+async def cmd_lottery_create(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/lottery_create <min_points> <winners> <title/prize>"""
+    if not is_admin(update.effective_user.id):
+        return
+
+    parts = update.message.text.split(maxsplit=3)
+    if len(parts) < 4:
+        await update.message.reply_text(
+            "Usage: /lottery_create <min_points> <winners> <title>\n"
+            "Example: /lottery_create 100 3 Perpvia Mystery Box"
+        )
+        return
+
+    try:
+        min_points = int(parts[1])
+        max_winners = int(parts[2])
+    except Exception:
+        await update.message.reply_text("min_points and winners must be numbers.")
+        return
+
+    if min_points < 0:
+        await update.message.reply_text("min_points cannot be negative.")
+        return
+    if max_winners <= 0:
+        await update.message.reply_text("winners must be greater than 0.")
+        return
+
+    title = parts[3].strip()
+    if not title:
+        await update.message.reply_text("Lottery title cannot be empty.")
+        return
+
+    cur = db_write(
+        "INSERT INTO lotteries (title,min_points,max_winners,point_type,status,created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (title, min_points, max_winners, "total", "open", dt.datetime.utcnow().isoformat())
+    )
+    lottery_id = cur.lastrowid
+
+    target_chat_id = GROUP_CHAT_ID or update.effective_chat.id
+    try:
+        sent = await ctx.bot.send_message(
+            chat_id=target_chat_id,
+            text=lottery_text(lottery_id),
+            reply_markup=lottery_keyboard(lottery_id)
+        )
+    except Exception as e:
+        log.error(f"send lottery message: {e}")
+        await update.message.reply_text(
+            "Lottery was created, but the bot could not publish the lottery message. "
+            "Check GROUP_CHAT_ID and bot permissions."
+        )
+        return
+
+    db_write(
+        "UPDATE lotteries SET chat_id=?, message_id=? WHERE lottery_id=?",
+        (target_chat_id, sent.message_id, lottery_id)
+    )
+
+    if update.effective_chat.id != target_chat_id:
+        await update.message.reply_text(f"✅ Lottery #{lottery_id} published to the official group.")
+
+async def cmd_lotteries(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    rows = db_read(
+        "SELECT lottery_id,title,min_points,max_winners,status FROM lotteries ORDER BY lottery_id DESC LIMIT 10"
+    )
+    if not rows:
+        await update.message.reply_text("No lotteries found yet.")
+        return
+    lines = ["🎁 Recent Lotteries\n"]
+    for r in rows:
+        count_row = db_read_one("SELECT COUNT(*) AS n FROM lottery_entries WHERE lottery_id=?", (r["lottery_id"],))
+        joined_count = count_row["n"] if count_row else 0
+        lines.append(
+            f"ID: {r['lottery_id']} | {r['status']}\n"
+            f"Prize: {r['title']}\n"
+            f"Requirement: {r['min_points']}+ total points | Winners: {r['max_winners']} | Participants: {joined_count}\n"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_lottery_draw(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin fallback command: /lottery_draw <lottery_id>"""
+    if not is_admin(update.effective_user.id):
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /lottery_draw <lottery_id>")
+        return
+    try:
+        lottery_id = int(ctx.args[0])
+    except Exception:
+        await update.message.reply_text("Lottery ID must be a number.")
+        return
+    err = await draw_lottery(ctx, lottery_id, source_message=update.message)
+    if err:
+        await update.message.reply_text(err)
+
+async def cmd_lottery_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/lottery_cancel <lottery_id>"""
+    if not is_admin(update.effective_user.id):
+        return
+    if not ctx.args:
+        await update.message.reply_text("Usage: /lottery_cancel <lottery_id>")
+        return
+    try:
+        lottery_id = int(ctx.args[0])
+    except Exception:
+        await update.message.reply_text("Lottery ID must be a number.")
+        return
+    lot = db_read_one("SELECT lottery_id,status FROM lotteries WHERE lottery_id=?", (lottery_id,))
+    if not lot:
+        await update.message.reply_text("Lottery not found.")
+        return
+    if lot["status"] != "open":
+        await update.message.reply_text("Only open lotteries can be cancelled.")
+        return
+    db_write("UPDATE lotteries SET status='cancelled' WHERE lottery_id=?", (lottery_id,))
+    await refresh_lottery_message(ctx, lottery_id)
+    await update.message.reply_text(f"Lottery #{lottery_id} cancelled.")
+
+async def on_lottery_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    data = query.data
+    if data.startswith("lottery_join:"):
+        try:
+            lottery_id = int(data.split(":", 1)[1])
+        except Exception:
+            await query.answer("Invalid lottery.", show_alert=True)
+            return
+
+        user = query.from_user
+        ensure_user(user.id, user.username or user.first_name)
+        lot = db_read_one(
+            "SELECT lottery_id,title,min_points,point_type,status FROM lotteries WHERE lottery_id=?",
+            (lottery_id,)
+        )
+        if not lot:
+            await query.answer("Lottery not found.", show_alert=True)
+            return
+        if lot["status"] != "open":
+            await query.answer("This lottery is already closed.", show_alert=True)
+            return
+
+        user_row = db_read_one("SELECT total_points,week_points FROM users WHERE user_id=?", (user.id,))
+        user_points = user_row["total_points"] if lot["point_type"] == "total" else user_row["week_points"]
+        if user_points < lot["min_points"]:
+            await query.answer(
+                f"You need {lot['min_points']} points. Your points: {user_points}.",
+                show_alert=True
+            )
+            return
+
+        exists = db_read_one(
+            "SELECT 1 FROM lottery_entries WHERE lottery_id=? AND user_id=?",
+            (lottery_id, user.id)
+        )
+        if exists:
+            await query.answer("You've already joined this lottery ✅", show_alert=False)
+            return
+
+        db_write(
+            "INSERT INTO lottery_entries (lottery_id,user_id,username,joined_at) VALUES (?,?,?,?)",
+            (lottery_id, user.id, user.username or user.first_name, dt.datetime.utcnow().isoformat())
+        )
+        await query.answer("✅ You joined this lottery!", show_alert=False)
+        await refresh_lottery_message(ctx, lottery_id)
+        return
+
+    if data.startswith("lottery_draw:"):
+        try:
+            lottery_id = int(data.split(":", 1)[1])
+        except Exception:
+            await query.answer("Invalid lottery.", show_alert=True)
+            return
+        if not is_admin(query.from_user.id):
+            await query.answer("Admin only.", show_alert=True)
+            return
+        err = await draw_lottery(ctx, lottery_id, source_message=query.message)
+        if err:
+            await query.answer(err, show_alert=True)
+        else:
+            await query.answer("Lottery drawn.", show_alert=False)
+        return
+
+# ----------------------------------------------------------------------------
 # Admin commands
 # ----------------------------------------------------------------------------
 async def cmd_award(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -567,7 +892,7 @@ async def cmd_reset_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(parts)<2 or parts[1].strip().upper()!="CONFIRM":
         await update.message.reply_text(
             "⚠️ PERMANENTLY DELETES all data. Cannot be undone.\nSend: /reset_all CONFIRM"); return
-    for t in ["users","talk","predict_polls","predict_votes","predict_streak","pending_invites","invite_links"]:
+    for t in ["users","talk","predict_polls","predict_votes","predict_streak","pending_invites","invite_links","lotteries","lottery_entries"]:
         db_write(f"DELETE FROM {t}")
     await update.message.reply_text("🧹 All data wiped. Fresh start!")
 
@@ -587,6 +912,10 @@ def main():
     app.add_handler(CommandHandler("predict",cmd_predict))
     app.add_handler(CommandHandler("settle",cmd_settle))
     app.add_handler(CommandHandler("polls",cmd_polls))
+    app.add_handler(CommandHandler("lottery_create",cmd_lottery_create))
+    app.add_handler(CommandHandler("lotteries",cmd_lotteries))
+    app.add_handler(CommandHandler("lottery_draw",cmd_lottery_draw))
+    app.add_handler(CommandHandler("lottery_cancel",cmd_lottery_cancel))
     app.add_handler(CommandHandler("award",cmd_award))
     app.add_handler(CommandHandler("top10",cmd_top10))
     app.add_handler(CommandHandler("invitetop",cmd_invitetop))
@@ -597,6 +926,7 @@ def main():
     app.add_handler(CommandHandler("clearpolls",cmd_clearpolls))
     app.add_handler(CommandHandler("reset_all",cmd_reset_all))
     app.add_handler(PollAnswerHandler(on_poll_answer))
+    app.add_handler(CallbackQueryHandler(on_lottery_button, pattern=r"^lottery_(join|draw):"))
     app.add_handler(ChatMemberHandler(on_chat_member,ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.job_queue.run_repeating(job_credit_invites,interval=3600,first=60)
