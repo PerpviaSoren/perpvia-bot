@@ -43,7 +43,7 @@ from telegram.ext import (
 # ----------------------------------------------------------------------------
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS   = set(int(x) for x in os.environ.get("ADMIN_IDS","").replace(" ","").split(",") if x)
-GROUP_USERNAME = os.environ.get("GROUP_USERNAME","Perpvia").lstrip("@")
+GROUP_USERNAME = os.environ.get("GROUP_USERNAME","PerpViaPioneerHub").lstrip("@")
 GROUP_CHAT_ID  = int(os.environ.get("GROUP_CHAT_ID","0") or 0)
 DB_PATH     = os.environ.get("DB_PATH","perpvia.db")
 GROUP_MSG_TTL  = int(os.environ.get("GROUP_MSG_TTL_SECONDS","8"))
