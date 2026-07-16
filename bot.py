@@ -25,6 +25,7 @@ bot's reply are auto-deleted after a short delay to keep the group chat quiet
 """
 
 import os
+import re
 import logging
 import datetime as dt
 import sqlite3
@@ -51,7 +52,7 @@ REDEEM_CONFIRM_TTL = int(os.environ.get("REDEEM_CONFIRM_TTL_SECONDS","300"))
 
 PTS_CHECKIN=5; PTS_CHECKIN_STREAK7=20; PTS_TALK_DAILY=5; TALK_THRESHOLD=5
 MIN_MSG_LETTERS = int(os.environ.get("MIN_MSG_LETTERS","10"))
-PTS_INVITE=15; INVITE_HOLD_HOURS=48
+PTS_INVITE=50; INVITE_HOLD_HOURS=48
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 log = logging.getLogger("perpvia")
@@ -317,6 +318,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/checkin - Daily check-in (+5, +20 bonus on a 7-day streak)\n"
         "/me - View my points\n/rank - View my ranking\n/invite - Get my personal invite link\n"
         "/tasks - Browse bonus tasks\n/submittask - Submit proof for a task\n/mytasks - My task submissions\n"
+        "/bindwallet - Link your EVM address for NFT rewards\n"
         "/shop - Browse the NFT Whitelist shop\n/redeem - Redeem points for a reward\n"
         "/myredeems - My redemption history\n"
         + group_line +
@@ -837,21 +839,25 @@ async def on_task_review_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------------------
 # NFT Whitelist shop
 # ----------------------------------------------------------------------------
+EVM_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
 async def cmd_bindwallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/bindwallet <address>"""
+    """/bindwallet <EVM address>"""
     u = update.effective_user
     parts = update.message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
-        await reply_cleanup(update, ctx, "Usage: /bindwallet <your wallet address>\ne.g. /bindwallet 0x1234...abcd")
+        await reply_cleanup(update, ctx, "Usage: /bindwallet <your EVM address>\ne.g. /bindwallet 0x1234...abcd")
         return
     address = parts[1].strip()
-    if " " in address or len(address) < 10 or len(address) > 100:
-        await reply_cleanup(update, ctx, "That doesn't look like a valid wallet address. Please double-check and try again.")
+    if not EVM_ADDRESS_RE.match(address):
+        await reply_cleanup(update, ctx,
+            "That doesn't look like a valid EVM address. It should start with 0x followed by 40 hex characters.\n"
+            "Please double-check and try again.")
         return
     ensure_user(u.id, u.username or u.first_name)
     db_write("UPDATE users SET wallet_address=? WHERE user_id=?", (address, u.id))
     await reply_cleanup(update, ctx,
-        f"✅ Wallet linked:\n{address}\n\nThis address will be used for any NFT Whitelist rewards you redeem.")
+        f"✅ EVM address linked:\n{address}\n\nThis address will be used for any NFT Whitelist rewards you redeem.")
 
 async def cmd_shop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     rows = db_read("SELECT item_id,title,description,points_cost,point_type,stock FROM shop_items "
@@ -866,7 +872,8 @@ async def cmd_shop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"#{r['item_id']} — {r['title']}\n   Cost: {r['points_cost']} {label} | {stock_label}")
         if r["description"]:
             lines.append(f"   {r['description']}")
-    lines.append("\nRedeem with: /redeem <item_id>")
+    lines.append("\nRedeem with: /redeem <item_id>\n"
+                 "(Make sure your EVM address is on file first — /bindwallet <address>)")
     await reply_cleanup(update, ctx, "\n".join(lines))
 
 async def cmd_redeem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -898,10 +905,15 @@ async def cmd_redeem(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if user_pts < item["points_cost"]:
         await reply_cleanup(update, ctx, f"Not enough points. You need {item['points_cost']}, you have {user_pts}.")
         return
+    if not user_row["wallet_address"]:
+        await reply_cleanup(update, ctx,
+            "⚠️ Please submit your EVM address first, so we know where to send your NFT Whitelist spot:\n"
+            "/bindwallet <your EVM address>\n\nThen run /redeem again.")
+        return
 
     label = "total points" if item["point_type"]=="total" else "weekly points"
     desc_line = f"{item['description']}\n" if item["description"] else ""
-    wallet_line = f"Wallet on file: {user_row['wallet_address']}\n" if user_row["wallet_address"] else ""
+    wallet_line = f"EVM address on file: {user_row['wallet_address']}\n"
     cmd_msg_id = update.message.message_id
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Confirm", callback_data=f"redeem_confirm:{item_id}:{u.id}:{cmd_msg_id}"),
@@ -952,6 +964,12 @@ async def on_redeem_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.answer("User not found.", show_alert=True)
         await query.edit_message_text("❌ Something went wrong. Please try again.")
         return
+    if not user_row["wallet_address"]:
+        await query.answer("EVM address required.", show_alert=True)
+        await query.edit_message_text(
+            "❌ You need to submit your EVM address before this redemption can go through:\n"
+            "/bindwallet <your EVM address>\n\nThen run /redeem again.")
+        return
     col = "total_points" if item["point_type"]=="total" else "week_points"
     user_pts = user_row[col]
     if user_pts < item["points_cost"]:
@@ -972,16 +990,93 @@ async def on_redeem_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Not enough points anymore.")
         return
     username = query.from_user.username or query.from_user.first_name
-    db_write("INSERT INTO redemptions (item_id,user_id,username,wallet_address,points_spent,point_type,status,created_at) "
-             "VALUES (?,?,?,?,?,?,?,?)",
-             (item_id, owner_id, username, user_row["wallet_address"],
-              item["points_cost"], item["point_type"], "pending", dt.datetime.utcnow().isoformat()))
+    cur = db_write(
+        "INSERT INTO redemptions (item_id,user_id,username,wallet_address,points_spent,point_type,status,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (item_id, owner_id, username, user_row["wallet_address"],
+         item["points_cost"], item["point_type"], "pending", dt.datetime.utcnow().isoformat()))
+    redemption_id = cur.lastrowid
     await query.answer("✅ Redeemed!")
     await query.edit_message_text(
         f"✅ Redeemed: {item['title']}\n-{item['points_cost']} points\n\n"
         f"Your request is pending admin review. You'll be notified here once it's confirmed.")
     if chat.type != "private":
         schedule_cleanup(ctx, chat.id, [query.message.message_id, cmd_msg_id])
+    await notify_admins_redemption(ctx, redemption_id, query.from_user, item, user_row["wallet_address"])
+
+async def notify_admins_redemption(ctx, redemption_id, user, item, wallet_address):
+    submitter = f"@{user.username}" if user.username else (user.first_name or f"User {user.id}")
+    text = (
+        f"📥 New redemption #{redemption_id}\n\n"
+        f"User: {submitter}\n"
+        f"Item: {item['title']} (-{item['points_cost']} pts)\n"
+        f"EVM Address: {wallet_address}"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Fulfill", callback_data=f"redeemreview_fulfill:{redemption_id}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"redeemreview_reject:{redemption_id}"),
+    ]])
+    for admin_id in ADMIN_IDS:
+        try:
+            await ctx.bot.send_message(chat_id=admin_id, text=text, reply_markup=kb)
+        except Exception as e:
+            log.warning(f"notify admin {admin_id} of redemption {redemption_id}: {e}")
+
+async def on_redeem_review_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handles the Fulfill/Reject buttons pushed to admins by notify_admins_redemption."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    if not is_admin(query.from_user.id):
+        await query.answer("Admin only.", show_alert=True)
+        return
+    try:
+        action, rid_s = query.data.split(":")
+        rid = int(rid_s)
+    except Exception:
+        await query.answer("Invalid redemption.", show_alert=True)
+        return
+
+    row = db_read_one(
+        "SELECT redemption_id,item_id,user_id,points_spent,point_type,status FROM redemptions WHERE redemption_id=?",
+        (rid,))
+    if not row:
+        await query.answer("Redemption not found.", show_alert=True)
+        return
+
+    reviewer = f"@{query.from_user.username}" if query.from_user.username else query.from_user.first_name
+
+    if action == "redeemreview_fulfill":
+        cur = db_write(
+            "UPDATE redemptions SET status='fulfilled', resolved_at=? WHERE redemption_id=? AND status='pending'",
+            (dt.datetime.utcnow().isoformat(), rid))
+        if cur.rowcount == 0:
+            await query.answer(f"Already {row['status']}.", show_alert=True)
+            return
+        await query.answer("Fulfilled.")
+        await query.edit_message_text((query.message.text or "") + f"\n\n✅ Fulfilled by {reviewer}")
+        try:
+            await ctx.bot.send_message(chat_id=row["user_id"],
+                                       text=f"🎉 Your redemption #{rid} has been fulfilled! Check your wallet.")
+        except Exception as e:
+            log.warning(f"notify fulfill: {e}")
+    else:
+        cur = db_write(
+            "UPDATE redemptions SET status='rejected', resolved_at=? WHERE redemption_id=? AND status='pending'",
+            (dt.datetime.utcnow().isoformat(), rid))
+        if cur.rowcount == 0:
+            await query.answer(f"Already {row['status']}.", show_alert=True)
+            return
+        col = "total_points" if row["point_type"]=="total" else "week_points"
+        db_write(f"UPDATE users SET {col}={col}+? WHERE user_id=?", (row["points_spent"], row["user_id"]))
+        db_write("UPDATE shop_items SET stock=stock+1 WHERE item_id=?", (row["item_id"],))
+        await query.answer("Rejected. Points refunded.")
+        await query.edit_message_text((query.message.text or "") + f"\n\n❌ Rejected by {reviewer} — points & stock refunded")
+        try:
+            await ctx.bot.send_message(chat_id=row["user_id"],
+                                       text=f"Your redemption #{rid} was rejected and your points have been refunded.")
+        except Exception as e:
+            log.warning(f"notify reject: {e}")
 
 async def cmd_myredeems(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -1087,7 +1182,7 @@ async def cmd_redeemlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 Pending redemptions\n"]
     for r in rows:
         name = f"@{r['username']}" if r["username"] else "Anonymous"
-        lines.append(f"#{r['redemption_id']} — {name}\n   Item: {r['title']}\n   Wallet: {r['wallet_address']}\n")
+        lines.append(f"#{r['redemption_id']} — {name}\n   Item: {r['title']}\n   EVM Address: {r['wallet_address']}\n")
     lines.append("Use /fulfill <id> or /reject <id> [reason] to resolve.")
     await update.message.reply_text("\n".join(lines))
 
@@ -1645,6 +1740,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_lottery_button, pattern=r"^lottery_(join|draw):"))
     app.add_handler(CallbackQueryHandler(on_redeem_button, pattern=r"^redeem_(confirm|cancel):"))
     app.add_handler(CallbackQueryHandler(on_task_review_button, pattern=r"^taskreview_(approve|reject):"))
+    app.add_handler(CallbackQueryHandler(on_redeem_review_button, pattern=r"^redeemreview_(fulfill|reject):"))
     app.add_handler(ChatMemberHandler(on_chat_member,ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo_submittask))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
