@@ -193,7 +193,8 @@ def init_db():
             title TEXT,
             description TEXT,
             category TEXT DEFAULT 'basic',
-            points INTEGER,
+            points_min INTEGER,
+            points_max INTEGER,
             repeatable INTEGER DEFAULT 0,
             status TEXT DEFAULT 'active',
             created_at TEXT
@@ -229,6 +230,12 @@ def init_db():
     except: pass
     # Safe migrations — shop_items columns
     try: db_write("ALTER TABLE shop_items ADD COLUMN description TEXT")
+    except: pass
+    # Safe migrations — tasks: points -> points_min/points_max (score range support)
+    for col, decl in [("points_min","INTEGER"), ("points_max","INTEGER")]:
+        try: db_write(f"ALTER TABLE tasks ADD COLUMN {col} {decl}")
+        except: pass
+    try: db_write("UPDATE tasks SET points_min=points, points_max=points WHERE points_min IS NULL")
     except: pass
     log.info("DB initialised")
 
@@ -485,10 +492,35 @@ async def job_credit_invites(ctx: ContextTypes.DEFAULT_TYPE):
 # ----------------------------------------------------------------------------
 # Tasks — admin-configured basic/UGC tasks, submitted by users and reviewed
 # by admins (points aren't awarded until an admin approves the submission).
+# Tasks can have a fixed score (points_min == points_max) or a score range
+# (e.g. 150-400) for quality-judged submissions like UGC content.
 # ----------------------------------------------------------------------------
+def parse_points_range(token):
+    """'200' -> (200,200); '150-400' -> (150,400); returns None if invalid."""
+    token = token.strip()
+    if "-" in token:
+        lo_s, _, hi_s = token.partition("-")
+        try:
+            lo = int(lo_s); hi = int(hi_s)
+        except Exception:
+            return None
+        if lo <= 0 or hi <= 0 or lo > hi:
+            return None
+        return lo, hi
+    try:
+        val = int(token)
+    except Exception:
+        return None
+    if val <= 0:
+        return None
+    return val, val
+
+def task_points_label(points_min, points_max):
+    return f"{points_min} pts" if points_min == points_max else f"{points_min}-{points_max} pts"
+
 async def cmd_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = db_read("SELECT task_id,title,description,category,points,repeatable FROM tasks "
-                   "WHERE status='active' ORDER BY category ASC, points ASC")
+    rows = db_read("SELECT task_id,title,description,category,points_min,points_max,repeatable FROM tasks "
+                   "WHERE status='active' ORDER BY category ASC, points_min ASC")
     if not rows:
         await reply_cleanup(update, ctx, "📋 No tasks available right now. Check back soon!")
         return
@@ -500,7 +532,8 @@ async def cmd_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"— {cat} —")
         for r in items:
             repeat_label = " (repeatable)" if r["repeatable"] else ""
-            lines.append(f"#{r['task_id']} — {r['title']} (+{r['points']} pts){repeat_label}")
+            pts_label = task_points_label(r["points_min"], r["points_max"])
+            lines.append(f"#{r['task_id']} — {r['title']} (+{pts_label}){repeat_label}")
             if r["description"]:
                 lines.append(f"   {r['description']}")
         lines.append("")
@@ -526,7 +559,8 @@ async def handle_task_submission(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     if not proof_text and not photo_file_id:
         await respond("Please include a proof link/description, or attach a photo.")
         return
-    task = db_read_one("SELECT task_id,title,points,repeatable,status FROM tasks WHERE task_id=?", (task_id,))
+    task = db_read_one("SELECT task_id,title,points_min,points_max,repeatable,status FROM tasks WHERE task_id=?",
+                       (task_id,))
     if not task or task["status"] != "active":
         await respond("Task not found.")
         return
@@ -603,14 +637,17 @@ async def on_photo_submittask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def notify_admins_task_submission(ctx, sub_id, user, task, proof, photo_file_id=None):
     submitter = f"@{user.username}" if user.username else (user.first_name or f"User {user.id}")
+    is_range = task["points_min"] != task["points_max"]
+    pts_label = task_points_label(task["points_min"], task["points_max"])
     text = (
         f"📥 New task submission #{sub_id}\n\n"
         f"User: {submitter}\n"
-        f"Task: {task['title']} (+{task['points']} pts)\n"
+        f"Task: {task['title']} (+{pts_label})\n"
         f"Proof: {proof}"
     )
+    approve_label = "✅ Approve (pick score)" if is_range else "✅ Approve"
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Approve", callback_data=f"taskreview_approve:{sub_id}"),
+        InlineKeyboardButton(approve_label, callback_data=f"taskreview_approve:{sub_id}"),
         InlineKeyboardButton("❌ Reject", callback_data=f"taskreview_reject:{sub_id}"),
     ]])
     for admin_id in ADMIN_IDS:
@@ -639,22 +676,24 @@ async def cmd_mytasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply_cleanup(update, ctx, "\n".join(lines))
 
 async def cmd_addtask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/addtask <points> <category> <repeatable:0/1> <title>[|description]"""
+    """/addtask <points or min-max> <category> <repeatable:0/1> <title>[|description]"""
     if not is_admin(update.effective_user.id): return
     parts = update.message.text.split(maxsplit=4)
     if len(parts) < 5:
         await update.message.reply_text(
-            "Usage: /addtask <points> <category> <repeatable:0/1> <title>[|description]\n"
-            "Example: /addtask 20 basic 0 Follow us on X|Follow @PerpviaNFT and stay followed.")
+            "Usage: /addtask <points or min-max> <category> <repeatable:0/1> <title>[|description]\n"
+            "Fixed score: /addtask 20 basic 0 Follow us on X|Follow @PerpviaNFT and stay followed.\n"
+            "Score range: /addtask 150-400 ugc 1 X Thread|Write a Thread about PerpVia Genesis Pass. Score varies by quality.")
         return
+    pts_range = parse_points_range(parts[1])
+    if pts_range is None:
+        await update.message.reply_text("points must be a positive number, or a range like 150-400 (min-max).")
+        return
+    points_min, points_max = pts_range
     try:
-        points = int(parts[1])
         repeatable = int(parts[3])
     except Exception:
-        await update.message.reply_text("points and repeatable must be numbers (repeatable: 0 or 1).")
-        return
-    if points <= 0:
-        await update.message.reply_text("points must be positive.")
+        await update.message.reply_text("repeatable must be a number (0 or 1).")
         return
     if repeatable not in (0, 1):
         await update.message.reply_text("repeatable must be 0 or 1.")
@@ -669,10 +708,12 @@ async def cmd_addtask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not title:
         await update.message.reply_text("Title cannot be empty.")
         return
-    cur = db_write("INSERT INTO tasks (title,description,category,points,repeatable,status,created_at) "
-                   "VALUES (?,?,?,?,?,?,?)",
-                   (title, description, category, points, repeatable, "active", dt.datetime.utcnow().isoformat()))
-    await update.message.reply_text(f"✅ Added task #{cur.lastrowid}: {title} (+{points} pts, {category})")
+    cur = db_write(
+        "INSERT INTO tasks (title,description,category,points_min,points_max,repeatable,status,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (title, description, category, points_min, points_max, repeatable, "active", dt.datetime.utcnow().isoformat()))
+    pts_label = task_points_label(points_min, points_max)
+    await update.message.reply_text(f"✅ Added task #{cur.lastrowid}: {title} (+{pts_label}, {category})")
 
 async def cmd_removetask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/removetask <task_id>"""
@@ -693,7 +734,7 @@ async def cmd_removetask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_tasksubmissions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
-    rows = db_read("SELECT s.submission_id,s.username,s.proof,s.photo_file_id,t.title,t.points "
+    rows = db_read("SELECT s.submission_id,s.username,s.proof,s.photo_file_id,t.title,t.points_min,t.points_max "
                    "FROM task_submissions s LEFT JOIN tasks t ON s.task_id=t.task_id "
                    "WHERE s.status='pending' ORDER BY s.submission_id ASC LIMIT 20")
     if not rows:
@@ -703,7 +744,8 @@ async def cmd_tasksubmissions(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         name = f"@{r['username']}" if r["username"] else "Anonymous"
         photo_note = " 📷" if r["photo_file_id"] else ""
-        lines.append(f"#{r['submission_id']} — {name}{photo_note}\n   Task: {r['title']} (+{r['points']} pts)\n   Proof: {r['proof']}\n")
+        pts_label = task_points_label(r["points_min"], r["points_max"])
+        lines.append(f"#{r['submission_id']} — {name}{photo_note}\n   Task: {r['title']} (+{pts_label})\n   Proof: {r['proof']}\n")
     lines.append("Use /approvetask <id> or /rejecttask <id> [reason] to resolve.")
     await update.message.reply_text("\n".join(lines))
 
@@ -726,15 +768,26 @@ async def cmd_approvetask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("points_override must be a number.")
             return
-    row = db_read_one("SELECT s.submission_id,s.user_id,s.status,t.points,t.title FROM task_submissions s "
-                      "LEFT JOIN tasks t ON s.task_id=t.task_id WHERE s.submission_id=?", (sid,))
+    row = db_read_one("SELECT s.submission_id,s.user_id,s.status,t.points_min,t.points_max,t.title "
+                      "FROM task_submissions s LEFT JOIN tasks t ON s.task_id=t.task_id "
+                      "WHERE s.submission_id=?", (sid,))
     if not row:
         await update.message.reply_text("Submission not found.")
         return
     if row["status"] != "pending":
         await update.message.reply_text(f"Already {row['status']}.")
         return
-    award_pts = override if override is not None else row["points"]
+    is_range = row["points_min"] != row["points_max"]
+    if is_range and override is None:
+        await update.message.reply_text(
+            f"This task has a score range ({row['points_min']}-{row['points_max']}). "
+            f"Specify the exact score: /approvetask {sid} <points>")
+        return
+    if override is not None and not (row["points_min"] <= override <= row["points_max"]):
+        await update.message.reply_text(
+            f"points_override must be between {row['points_min']} and {row['points_max']}.")
+        return
+    award_pts = override if override is not None else row["points_min"]
     add_points(row["user_id"], award_pts)
     db_write("UPDATE task_submissions SET status='approved', points_awarded=?, resolved_at=? WHERE submission_id=?",
              (award_pts, dt.datetime.utcnow().isoformat(), sid))
@@ -789,8 +842,9 @@ async def on_task_review_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.answer("Invalid submission.", show_alert=True)
         return
 
-    row = db_read_one("SELECT s.submission_id,s.user_id,s.status,t.points,t.title FROM task_submissions s "
-                      "LEFT JOIN tasks t ON s.task_id=t.task_id WHERE s.submission_id=?", (sid,))
+    row = db_read_one("SELECT s.submission_id,s.user_id,s.status,t.points_min,t.points_max,t.title "
+                      "FROM task_submissions s LEFT JOIN tasks t ON s.task_id=t.task_id "
+                      "WHERE s.submission_id=?", (sid,))
     if not row:
         await query.answer("Submission not found.", show_alert=True)
         return
@@ -806,7 +860,13 @@ async def on_task_review_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text((query.message.text or "") + suffix)
 
     if action == "taskreview_approve":
-        award_pts = row["points"]
+        if row["points_min"] != row["points_max"]:
+            await query.answer(
+                f"This task has a score range ({row['points_min']}-{row['points_max']}). "
+                f"Use /approvetask {sid} <points> to approve with a specific score.",
+                show_alert=True)
+            return
+        award_pts = row["points_min"]
         cur = db_write(
             "UPDATE task_submissions SET status='approved', points_awarded=?, resolved_at=? "
             "WHERE submission_id=? AND status='pending'",
