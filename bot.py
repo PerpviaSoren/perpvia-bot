@@ -177,6 +177,15 @@ def init_db():
             resolved_at TEXT,
             note TEXT
         )""",
+        """CREATE TABLE IF NOT EXISTS review_cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ref_type TEXT,
+            ref_id INTEGER,
+            admin_id INTEGER,
+            message_id INTEGER,
+            has_photo INTEGER DEFAULT 0,
+            base_text TEXT
+        )""",
         """CREATE TABLE IF NOT EXISTS member_events (
             event_id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -312,6 +321,30 @@ async def reply_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text, **
     if chat.type != "private":
         schedule_cleanup(ctx, chat.id, [update.message.message_id, sent.message_id])
     return sent
+
+# ----------------------------------------------------------------------------
+# Multi-admin review cards — when a submission/redemption is pushed to admins,
+# every admin gets their own copy of the message. record_review_cards saves
+# each copy's (chat_id, message_id) so sync_review_cards can edit ALL of them
+# once any admin resolves it, instead of leaving stale buttons on the others.
+# ----------------------------------------------------------------------------
+def record_review_card(ref_type, ref_id, admin_id, message_id, has_photo, base_text):
+    db_write("INSERT INTO review_cards (ref_type,ref_id,admin_id,message_id,has_photo,base_text) "
+             "VALUES (?,?,?,?,?,?)", (ref_type, ref_id, admin_id, message_id, int(has_photo), base_text))
+
+async def sync_review_cards(ctx, ref_type, ref_id, suffix):
+    rows = db_read("SELECT admin_id,message_id,has_photo,base_text FROM review_cards WHERE ref_type=? AND ref_id=?",
+                   (ref_type, ref_id))
+    for r in rows:
+        new_text = (r["base_text"] or "") + suffix
+        try:
+            if r["has_photo"]:
+                await ctx.bot.edit_message_caption(chat_id=r["admin_id"], message_id=r["message_id"],
+                                                   caption=new_text[:1024])
+            else:
+                await ctx.bot.edit_message_text(chat_id=r["admin_id"], message_id=r["message_id"], text=new_text)
+        except Exception as e:
+            log.debug(f"sync review card admin={r['admin_id']} msg={r['message_id']}: {e}")
 
 # ----------------------------------------------------------------------------
 # User commands
@@ -653,9 +686,12 @@ async def notify_admins_task_submission(ctx, sub_id, user, task, proof, photo_fi
     for admin_id in ADMIN_IDS:
         try:
             if photo_file_id:
-                await ctx.bot.send_photo(chat_id=admin_id, photo=photo_file_id, caption=text[:1024], reply_markup=kb)
+                sent = await ctx.bot.send_photo(chat_id=admin_id, photo=photo_file_id, caption=text[:1024],
+                                                reply_markup=kb)
+                record_review_card("task", sub_id, admin_id, sent.message_id, True, text)
             else:
-                await ctx.bot.send_message(chat_id=admin_id, text=text, reply_markup=kb)
+                sent = await ctx.bot.send_message(chat_id=admin_id, text=text, reply_markup=kb)
+                record_review_card("task", sub_id, admin_id, sent.message_id, False, text)
         except Exception as e:
             log.warning(f"notify admin {admin_id} of submission {sub_id}: {e}")
 
@@ -676,30 +712,40 @@ async def cmd_mytasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await reply_cleanup(update, ctx, "\n".join(lines))
 
 async def cmd_addtask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """/addtask <points or min-max> <category> <repeatable:0/1> <title>[|description]"""
+    """/addtask <points or min-max> <category> [repeatable] <title>[|description]
+    By default a task can only be submitted once per user. Add the optional
+    'repeatable' keyword to allow resubmission (still only ever paid once —
+    see the anti-farm check in on_task_review_button / cmd_approvetask)."""
     if not is_admin(update.effective_user.id): return
-    parts = update.message.text.split(maxsplit=4)
-    if len(parts) < 5:
+    parts = update.message.text.split(maxsplit=3)
+    if len(parts) < 4:
         await update.message.reply_text(
-            "Usage: /addtask <points or min-max> <category> <repeatable:0/1> <title>[|description]\n"
-            "Fixed score: /addtask 20 basic 0 Follow us on X|Follow @PerpviaNFT and stay followed.\n"
-            "Score range: /addtask 150-400 ugc 1 X Thread|Write a Thread about PerpVia Genesis Pass. Score varies by quality.")
+            "Usage: /addtask <points or min-max> <category> [repeatable] <title>[|description]\n"
+            "By default users can only submit a task once. Add 'repeatable' to allow resubmission "
+            "(e.g. retrying after rejection) — they're still only ever paid once for it.\n\n"
+            "One-time task: /addtask 20 basic Follow us on X|Follow @PerpviaNFT and stay followed.\n"
+            "Resubmittable, score range: /addtask 150-400 ugc repeatable X Thread|Write a Thread about PerpVia Genesis Pass. Score varies by quality.")
         return
     pts_range = parse_points_range(parts[1])
     if pts_range is None:
         await update.message.reply_text("points must be a positive number, or a range like 150-400 (min-max).")
         return
     points_min, points_max = pts_range
-    try:
-        repeatable = int(parts[3])
-    except Exception:
-        await update.message.reply_text("repeatable must be a number (0 or 1).")
-        return
-    if repeatable not in (0, 1):
-        await update.message.reply_text("repeatable must be 0 or 1.")
-        return
     category = parts[2].strip().lower() or "basic"
-    rest = parts[4].strip()
+    rest = parts[3].strip()
+
+    # Optional leading flag: the 'repeatable' keyword, or legacy 0/1 for backward compatibility.
+    first_word, _, remainder = rest.partition(" ")
+    fw = first_word.lower()
+    if fw in ("repeatable", "1"):
+        repeatable = 1
+        rest = remainder.strip()
+    elif fw == "0":
+        repeatable = 0
+        rest = remainder.strip()
+    else:
+        repeatable = 0
+
     if "|" in rest:
         title, description = rest.split("|", 1)
         title = title.strip(); description = description.strip()
@@ -713,7 +759,8 @@ async def cmd_addtask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "VALUES (?,?,?,?,?,?,?,?)",
         (title, description, category, points_min, points_max, repeatable, "active", dt.datetime.utcnow().isoformat()))
     pts_label = task_points_label(points_min, points_max)
-    await update.message.reply_text(f"✅ Added task #{cur.lastrowid}: {title} (+{pts_label}, {category})")
+    repeat_note = ", repeatable" if repeatable else ", one-time only"
+    await update.message.reply_text(f"✅ Added task #{cur.lastrowid}: {title} (+{pts_label}, {category}{repeat_note})")
 
 async def cmd_removetask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/removetask <task_id>"""
@@ -768,7 +815,7 @@ async def cmd_approvetask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("points_override must be a number.")
             return
-    row = db_read_one("SELECT s.submission_id,s.user_id,s.status,t.points_min,t.points_max,t.title "
+    row = db_read_one("SELECT s.submission_id,s.task_id,s.user_id,s.status,t.points_min,t.points_max,t.title "
                       "FROM task_submissions s LEFT JOIN tasks t ON s.task_id=t.task_id "
                       "WHERE s.submission_id=?", (sid,))
     if not row:
@@ -787,11 +834,28 @@ async def cmd_approvetask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"points_override must be between {row['points_min']} and {row['points_max']}.")
         return
+    # Anti-farm: a user can only ever be paid once for the same task.
+    dup = db_read_one(
+        "SELECT submission_id FROM task_submissions WHERE task_id=? AND user_id=? AND status='approved'",
+        (row["task_id"], row["user_id"]))
+    if dup:
+        db_write(
+            "UPDATE task_submissions SET status='rejected', resolved_at=?, note=? WHERE submission_id=?",
+            (dt.datetime.utcnow().isoformat(),
+             f"Auto-rejected: user already paid for this task (submission #{dup['submission_id']}).", sid))
+        await update.message.reply_text(
+            f"🚫 Blocked — this user was already paid for this task (submission #{dup['submission_id']}). "
+            f"Auto-rejected to prevent duplicate rewards.")
+        await sync_review_cards(ctx, "task", sid,
+                                f"\n\n🚫 Auto-rejected — user already paid for this task (see #{dup['submission_id']})")
+        return
     award_pts = override if override is not None else row["points_min"]
     add_points(row["user_id"], award_pts)
     db_write("UPDATE task_submissions SET status='approved', points_awarded=?, resolved_at=? WHERE submission_id=?",
              (award_pts, dt.datetime.utcnow().isoformat(), sid))
     await update.message.reply_text(f"✅ Submission #{sid} approved. +{award_pts} pts awarded.")
+    reviewer = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+    await sync_review_cards(ctx, "task", sid, f"\n\n✅ Approved by {reviewer} (+{award_pts} pts)")
     try:
         await ctx.bot.send_message(chat_id=row["user_id"],
                                    text=f"🎉 Your task \"{row['title']}\" was approved! +{award_pts} points.")
@@ -821,6 +885,8 @@ async def cmd_rejecttask(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db_write("UPDATE task_submissions SET status='rejected', resolved_at=?, note=? WHERE submission_id=?",
              (dt.datetime.utcnow().isoformat(), reason, sid))
     await update.message.reply_text(f"❌ Submission #{sid} rejected.")
+    reviewer = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+    await sync_review_cards(ctx, "task", sid, f"\n\n❌ Rejected by {reviewer}")
     try:
         note_line = f"\nReason: {reason}" if reason else ""
         await ctx.bot.send_message(chat_id=row["user_id"], text=f"Your task submission #{sid} was rejected.{note_line}")
@@ -842,7 +908,7 @@ async def on_task_review_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.answer("Invalid submission.", show_alert=True)
         return
 
-    row = db_read_one("SELECT s.submission_id,s.user_id,s.status,t.points_min,t.points_max,t.title "
+    row = db_read_one("SELECT s.submission_id,s.task_id,s.user_id,s.status,t.points_min,t.points_max,t.title "
                       "FROM task_submissions s LEFT JOIN tasks t ON s.task_id=t.task_id "
                       "WHERE s.submission_id=?", (sid,))
     if not row:
@@ -851,20 +917,29 @@ async def on_task_review_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     reviewer = f"@{query.from_user.username}" if query.from_user.username else query.from_user.first_name
 
-    async def append_to_review_card(suffix):
-        # The card may have been sent as a photo (with caption) or a plain text message.
-        if query.message.photo:
-            new_caption = (query.message.caption or "") + suffix
-            await query.edit_message_caption(caption=new_caption[:1024])
-        else:
-            await query.edit_message_text((query.message.text or "") + suffix)
-
     if action == "taskreview_approve":
         if row["points_min"] != row["points_max"]:
             await query.answer(
                 f"This task has a score range ({row['points_min']}-{row['points_max']}). "
                 f"Use /approvetask {sid} <points> to approve with a specific score.",
                 show_alert=True)
+            return
+        # Anti-farm: a user can only ever be paid once for the same task, even if
+        # the task allows repeat submissions (e.g. retrying after a rejection).
+        dup = db_read_one(
+            "SELECT submission_id FROM task_submissions WHERE task_id=? AND user_id=? AND status='approved'",
+            (row["task_id"], row["user_id"]))
+        if dup:
+            db_write(
+                "UPDATE task_submissions SET status='rejected', resolved_at=?, note=? "
+                "WHERE submission_id=? AND status='pending'",
+                (dt.datetime.utcnow().isoformat(),
+                 f"Auto-rejected: user already paid for this task (submission #{dup['submission_id']}).", sid))
+            await query.answer(
+                f"Blocked — this user was already paid for this task (submission #{dup['submission_id']}). "
+                f"Auto-rejected to prevent duplicate rewards.", show_alert=True)
+            await sync_review_cards(ctx, "task", sid,
+                                    f"\n\n🚫 Auto-rejected — user already paid for this task (see #{dup['submission_id']})")
             return
         award_pts = row["points_min"]
         cur = db_write(
@@ -876,7 +951,7 @@ async def on_task_review_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         add_points(row["user_id"], award_pts)
         await query.answer("Approved.")
-        await append_to_review_card(f"\n\n✅ Approved by {reviewer} (+{award_pts} pts)")
+        await sync_review_cards(ctx, "task", sid, f"\n\n✅ Approved by {reviewer} (+{award_pts} pts)")
         try:
             await ctx.bot.send_message(chat_id=row["user_id"],
                                        text=f"🎉 Your task \"{row['title']}\" was approved! +{award_pts} points.")
@@ -890,7 +965,7 @@ async def on_task_review_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.answer(f"Already {row['status']}.", show_alert=True)
             return
         await query.answer("Rejected.")
-        await append_to_review_card(f"\n\n❌ Rejected by {reviewer}")
+        await sync_review_cards(ctx, "task", sid, f"\n\n❌ Rejected by {reviewer}")
         try:
             await ctx.bot.send_message(chat_id=row["user_id"], text=f"Your task submission #{sid} was rejected.")
         except Exception as e:
@@ -1078,7 +1153,8 @@ async def notify_admins_redemption(ctx, redemption_id, user, item, wallet_addres
     ]])
     for admin_id in ADMIN_IDS:
         try:
-            await ctx.bot.send_message(chat_id=admin_id, text=text, reply_markup=kb)
+            sent = await ctx.bot.send_message(chat_id=admin_id, text=text, reply_markup=kb)
+            record_review_card("redeem", redemption_id, admin_id, sent.message_id, False, text)
         except Exception as e:
             log.warning(f"notify admin {admin_id} of redemption {redemption_id}: {e}")
 
@@ -1114,7 +1190,7 @@ async def on_redeem_review_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             await query.answer(f"Already {row['status']}.", show_alert=True)
             return
         await query.answer("Fulfilled.")
-        await query.edit_message_text((query.message.text or "") + f"\n\n✅ Fulfilled by {reviewer}")
+        await sync_review_cards(ctx, "redeem", rid, f"\n\n✅ Fulfilled by {reviewer}")
         try:
             await ctx.bot.send_message(chat_id=row["user_id"],
                                        text=f"🎉 Your redemption #{rid} has been fulfilled! Check your wallet.")
@@ -1131,7 +1207,7 @@ async def on_redeem_review_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         db_write(f"UPDATE users SET {col}={col}+? WHERE user_id=?", (row["points_spent"], row["user_id"]))
         db_write("UPDATE shop_items SET stock=stock+1 WHERE item_id=?", (row["item_id"],))
         await query.answer("Rejected. Points refunded.")
-        await query.edit_message_text((query.message.text or "") + f"\n\n❌ Rejected by {reviewer} — points & stock refunded")
+        await sync_review_cards(ctx, "redeem", rid, f"\n\n❌ Rejected by {reviewer} — points & stock refunded")
         try:
             await ctx.bot.send_message(chat_id=row["user_id"],
                                        text=f"Your redemption #{rid} was rejected and your points have been refunded.")
@@ -1267,6 +1343,8 @@ async def cmd_fulfill(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db_write("UPDATE redemptions SET status='fulfilled', resolved_at=? WHERE redemption_id=?",
              (dt.datetime.utcnow().isoformat(), rid))
     await update.message.reply_text(f"✅ Redemption #{rid} marked as fulfilled.")
+    reviewer = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+    await sync_review_cards(ctx, "redeem", rid, f"\n\n✅ Fulfilled by {reviewer}")
     try:
         await ctx.bot.send_message(chat_id=row["user_id"],
                                    text=f"🎉 Your redemption #{rid} has been fulfilled! Check your wallet.")
@@ -1300,6 +1378,8 @@ async def cmd_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     db_write("UPDATE redemptions SET status='rejected', resolved_at=?, note=? WHERE redemption_id=?",
              (dt.datetime.utcnow().isoformat(), reason, rid))
     await update.message.reply_text(f"❌ Redemption #{rid} rejected. Points and stock refunded.")
+    reviewer = f"@{update.effective_user.username}" if update.effective_user.username else update.effective_user.first_name
+    await sync_review_cards(ctx, "redeem", rid, f"\n\n❌ Rejected by {reviewer} — points & stock refunded")
     try:
         note_line = f"\nReason: {reason}" if reason else ""
         await ctx.bot.send_message(chat_id=row["user_id"],
@@ -1749,7 +1829,7 @@ async def cmd_reset_all(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "⚠️ PERMANENTLY DELETES all data. Cannot be undone.\nSend: /reset_all CONFIRM"); return
     for t in ["users","talk","pending_invites","invite_links","lotteries","lottery_entries","shop_items","redemptions",
-              "member_events","message_log","tasks","task_submissions"]:
+              "member_events","message_log","tasks","task_submissions","review_cards"]:
         db_write(f"DELETE FROM {t}")
     await update.message.reply_text("🧹 All data wiped. Fresh start!")
 
