@@ -1775,6 +1775,26 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data.name=f"perpvia_points_{today_str()}.csv"
     await ctx.bot.send_document(chat_id=update.effective_chat.id,document=data)
 
+async def cmd_exportredeems(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Exports the full redemption history (pending, fulfilled, and rejected) as CSV."""
+    if not is_admin(update.effective_user.id): return
+    import csv, io
+    rows = db_read(
+        "SELECT r.redemption_id,r.user_id,r.username,s.title AS item_title,r.points_spent,r.point_type,"
+        "r.wallet_address,r.status,r.created_at,r.resolved_at,r.note "
+        "FROM redemptions r LEFT JOIN shop_items s ON r.item_id=s.item_id "
+        "ORDER BY r.redemption_id ASC")
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["redemption_id","user_id","username","item","points_spent","point_type",
+               "evm_address","status","created_at","resolved_at","note"])
+    for r in rows:
+        w.writerow([r["redemption_id"], r["user_id"], r["username"], r["item_title"], r["points_spent"],
+                   r["point_type"], r["wallet_address"], r["status"], r["created_at"], r["resolved_at"], r["note"]])
+    buf.seek(0)
+    data = io.BytesIO(buf.getvalue().encode("utf-8-sig"))
+    data.name = f"perpvia_redemptions_{today_str()}.csv"
+    await ctx.bot.send_document(chat_id=update.effective_chat.id, document=data)
+
 async def cmd_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     total=db_read_one("SELECT COUNT(*) AS n FROM users")["n"]
@@ -1873,6 +1893,7 @@ def main():
     app.add_handler(CommandHandler("invitetop",cmd_invitetop))
     app.add_handler(CommandHandler("reset_week",cmd_reset_week))
     app.add_handler(CommandHandler("export",cmd_export))
+    app.add_handler(CommandHandler("exportredeems",cmd_exportredeems))
     app.add_handler(CommandHandler("count",cmd_count))
     app.add_handler(CommandHandler("stats",cmd_stats))
     app.add_handler(CommandHandler("chatid",cmd_chatid))
